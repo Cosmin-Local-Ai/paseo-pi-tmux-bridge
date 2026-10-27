@@ -940,3 +940,129 @@ d294115 chore(release): cut 0.13.2
   the in-UI round-trip itself was not exercised.
 - A macOS/Homebrew tmux install (`/opt/homebrew/bin/tmux` is in the list but was not exercised).
 - Concurrent agents under the new resolution code (unchanged naming/locking paths, proven earlier).
+
+---
+
+# 2026-10-28 (fourth pass) — namespaced tmux for sandboxed providers
+
+**Why.** The user's `pi-recovery` provider does not run Pi on the host:
+`~/.paseo/config.json` declares `command: ["/home/cosmin/.local/bin/paseo-pi-recovery"]`, and that
+wrapper is `exec sbx exec -i -w "$PWD" "pi-recovery-test" -- /usr/local/share/npm-global/bin/pi
+"${args[@]}"`. The container has 11 virtual mounts, **no shared `/home`, no shared `/tmp`**, and
+already ships tmux 3.6 at `/usr/bin/tmux`. The previous design created the session on the host and
+injected the host socket `/tmp/tmux-1000/default`, which cannot exist inside the container — so the
+agent got a `TMUX` pointing at nothing while tmux would have worked on its own. That made the plugin
+actively harmful for sandboxed providers.
+
+## What changed
+
+- `shared/contracts.ts` — `tmuxExec` (global argv prefix), `providerTmuxExec` (per-provider map),
+  `tmuxPath` redefined as the path **inside** the namespace, and `tmuxExecLabel` on both status RPCs.
+- `server/tmux.ts` — `applyExecPlaceholders` (`{cwd}`, `{agentId}`), `resolveExecPrefix`
+  (provider entry > global > host; explicit `[]` = host), `tmuxInvocation`, `attachInvocation`,
+  `shellProbeInvocation`, `execLabel`, `tmuxDirToInject`, `TMUX_REACHABLE_ARGS` (plain shell) kept
+  separate from `TMUX_WHICH_ARGS` (login shell), `displayServerPidCmd`/`parseServerPid`, and
+  `TmuxClient` now runs every command through the invocation helpers.
+- `index.server.ts` — one `TmuxTarget` per provider (path + prefix + label + reachability), cached
+  and re-resolved when settings change; every tmux call, the availability probe, and the attach
+  terminal's `command` go through `execThrough(prefix, …)`; `TMUX` is built from `#{socket_path}` and
+  `#{pid}` read **inside**; `PATH` is prepended only when `command -v tmux` fails inside; the
+  bookkeeping record pins provider/prefix/path/label so cleanup follows the session, with a
+  re-probe fallback after `plugin reload`; `cleanedUp` makes cleanup single-shot; the "no session
+  found" case is now logged instead of silent.
+- `client/panel.tsx` — header shows `N panes · <namespace> · <path>`, a missing tmux reads
+  `tmux not found in <namespace>` with the namespace and the tried list.
+- `client/settings.tsx` — `tmux path`, `tmux exec prefix` (JSON), `provider exec prefixes` (JSON),
+  `extra Pi provider ids` (JSON), plus a summary line.
+- `tests/namespaced-sandbox-harness.sh` — new: `sudo unshare -m` holder + `nsenter --mount=<nsfile>`
+  wrapper standing in for a container runtime.
+
+## Harness (proven faithful before any code claim)
+
+```
+$ ./tests/namespaced-sandbox-harness.sh start
+sandbox 'pi-namespaced-test': holder pid 31532, namespace file /home/agent/sbx-test/pi-namespaced-test.mntns
+$ sbx exec -i -w /home/agent/paseo-sbx-ws pi-namespaced-test -- sh -c 'ls -A /tmp/tmux-1000; tmux ls; tmux new-session -d -s probe && tmux ls'
+tmux dir inside:
+tmux ls inside: error connecting to /tmp/tmux-1000/default (No such file or directory)
+probe: 1 windows (created Wed Oct 28 00:52:46 2026)
+```
+Host `tmux ls` still lists its own sessions, and the host socket is invisible inside.
+
+## Live run A — namespaced provider (`pi-namespaced`, providerTmuxExec)
+
+Provider `pi-namespaced` (`extends: "pi"`, command = the sbx wrapper), settings
+`providerTmuxExec: {"pi-namespaced":["/home/agent/sbx-test/sbx","exec","-i","-w","{cwd}","pi-namespaced-test","--"]}`.
+
+```
+[pi-tmux-bridge] tmux resolved to /usr/bin/tmux (sbx:pi-namespaced-test)
+[pi-tmux-bridge] agent 979328f2-… (create) -> tmux paseo-979328f2-… in sbx:pi-namespaced-test pane %0
+$ tmux ls | grep paseo-            -> (none on host — correct)
+$ sbx exec … -- tmux ls            -> paseo-979328f2-…: 1 windows … (attached)
+```
+Agent process (mount namespace `mnt:[4026533318]`, host is `mnt:[4026533244]`):
+```
+TMUX=/tmp/tmux-1000/default,31662,0        # inode 5 (sandbox tmpfs); host socket is inode 1048621
+TMUX_PANE=%0
+PASEO_TMUX_SESSION=paseo-979328f2-…
+PATH UNCHANGED vs daemon  (tmux already reachable inside → no rewrite)
+```
+Amos subagent call → `list-panes` **inside** the namespace: `%0 idx=0 active=1`, `%1 idx=1 active=0`;
+host has no such session. Panel showed both cards with live captures and
+`2 panes · sbx:pi-namespaced-test · /usr/bin/tmux`; Focus made `%1 active=1`, Kill pane left `%0` only
+(both verified by `list-panes` inside). After `plugin reload` (bookkeeping empty) + archive:
+```
+[pi-tmux-bridge] tmux resolved to /usr/bin/tmux (sbx:pi-namespaced-test)
+[pi-tmux-bridge] killed tmux session paseo-979328f2-… in sbx:pi-namespaced-test (archived)
+$ sbx exec … -- tmux ls            -> no server running on /tmp/tmux-1000/default
+```
+Evidence: `evidence/21-namespaced-attach-terminal-two-panes.png`,
+`22-panel-namespaced-namespace-label-two-panes.png`, `23-panel-namespaced-after-kill-pane.png`.
+
+## Live run B — global `tmuxExec` applies when no provider entry matches
+
+Same daemon, `tmuxExec` set to the sandbox prefix, agent created with provider `pi` (no provider
+entry): `tmux resolved to /usr/bin/tmux (sbx:pi-namespaced-test)`, session inside the sandbox only
+(`can't find session` on the host). `{cwd}` substitution proven by the wrapper's `-w {cwd}`.
+
+## Live run C — host path non-regression (daemon `PATH` without tmux)
+
+Daemon started with `PATH=/tmp/no-tmux-bin:/usr/local/bin:…` (788 symlinks of `/usr/bin` minus
+`tmux`), provider `pi`, empty prefixes:
+```
+[pi-tmux-bridge] tmux resolved to /usr/bin/tmux (host)
+injected dirs vs daemon: ['/usr/bin']
+agent can run tmux: /usr/bin/tmux
+host panes = 2 after 1s   # %17 + %18 after one Amos subagent call
+```
+Panel: `2 panes · host · /usr/bin/tmux` (`evidence/24-host-nonregression-panel-two-panes.png`).
+Settings screen with the new fields: `evidence/25-settings-namespace-fields.png`.
+
+## Bugs the live runs caught (static checks passed)
+
+1. **PATH injection silently stopped.** Reusing the login-shell `command -v tmux` answer for
+   reachability made the plugin believe tmux was on the agent `PATH`; the agent could not run tmux
+   and Amos created no pane. Fixed by a second plain-shell probe (`TMUX_REACHABLE_ARGS`), with a unit
+   test asserting the two probes differ.
+2. **`directory /tmp/tmux-1000 has unsafe permissions`** — a tmpfs socket dir owned by root is
+   refused by tmux. The harness now mounts `uid=$UID,gid=$GID,mode=700`.
+3. **A private `/tmp` breaks the provider before the plugin is involved**: Paseo passes
+   `--extension /tmp/paseo-pi-extension-XXXX/paseo-integration.mjs`, so pi exits with
+   `Extension path does not exist`. The harness isolates only `/tmp/tmux-$UID`; documented as a known
+   trap for real sandboxed providers.
+4. **Double cleanup** (`agent.closed` + `agent.archived` for one archive) produced a duplicate
+   terminal kill and a bogus `kill-session … server exited unexpectedly`; cleanup is now single-shot
+   per agent id, re-armed on a new `session_open`.
+
+## Static checks
+
+```
+$ node --test tests/unit.test.ts        → tests 52, pass 52, fail 0
+$ tsc --noEmit -p tsconfig.json         → clean
+$ tsx tests/compile-check.mjs           → compile-check: PASS, badContributionIds: []
+```
+
+## Still not proven
+
+Real `sbx`/containerd sandbox (the harness is `unshare`+`nsenter`, not their runtime); `agent.closed`
+firing on its own; `resume`/`import` in a live daemon; Windows hosts.

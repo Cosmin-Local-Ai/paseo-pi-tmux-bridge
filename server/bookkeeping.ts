@@ -15,6 +15,14 @@ export interface BridgeRecord {
   cwd: string;
   terminalId: string | null;
   terminalName: string | null;
+  /**
+   * Where the session was created. Cleanup and the panel must use the same
+   * namespace, not whatever the settings say now.
+   */
+  provider: string;
+  tmuxPath: string;
+  tmuxPrefix: string[];
+  tmuxLabel: string;
   openedAt: string;
   updatedAt: string;
 }
@@ -44,6 +52,10 @@ export class BridgeBookkeeping {
     sessionName: string;
     workspaceId: string | null;
     cwd: string;
+    provider?: string;
+    tmuxPath?: string;
+    tmuxPrefix?: string[];
+    tmuxLabel?: string;
   }): BridgeRecord {
     const now = new Date().toISOString();
     const previous = this.records.get(input.agentId);
@@ -52,6 +64,10 @@ export class BridgeBookkeeping {
       sessionName: input.sessionName,
       workspaceId: input.workspaceId,
       cwd: input.cwd,
+      provider: input.provider ?? previous?.provider ?? "",
+      tmuxPath: input.tmuxPath ?? previous?.tmuxPath ?? "",
+      tmuxPrefix: input.tmuxPrefix ?? previous?.tmuxPrefix ?? [],
+      tmuxLabel: input.tmuxLabel ?? previous?.tmuxLabel ?? "host",
       terminalId: previous?.terminalId ?? null,
       terminalName: previous?.terminalName ?? null,
       openedAt: previous?.openedAt ?? now,
@@ -69,6 +85,10 @@ export class BridgeBookkeeping {
         sessionName: "",
         workspaceId: null,
         cwd: "",
+        provider: "",
+        tmuxPath: "",
+        tmuxPrefix: [],
+        tmuxLabel: "host",
         terminalId,
         terminalName,
         openedAt: new Date().toISOString(),

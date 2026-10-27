@@ -23,9 +23,11 @@ interface Snapshot {
   sessionName: string;
   exists: boolean;
   panes: TmuxPaneDto[];
-  /** False when the daemon host has no usable tmux at all. */
+  /** False when the agent's namespace has no usable tmux at all. */
   tmuxAvailable: boolean;
   tmuxPath: string;
+  /** Where tmux runs: `host`, or a prefix label such as `sbx:pi-recovery-test`. */
+  tmuxExecLabel: string;
   tmuxTried: string[];
   detail?: string;
 }
@@ -224,7 +226,7 @@ function TmuxPanelBody({
   // The daemon could not resolve tmux anywhere. Saying so beats an empty panel.
   const tmuxMissing = snapshot !== null && snapshot.tmuxAvailable === false;
   const missingText =
-    snapshot?.detail ?? "tmux not found on daemon host — install tmux or set tmuxPath";
+    snapshot?.detail ?? "tmux not found in the agent's namespace — install tmux there or set tmuxPath";
 
   return (
     <View style={styles.screen}>
@@ -236,15 +238,20 @@ function TmuxPanelBody({
         />
         <Text style={styles.title}>
           {tmuxMissing
-            ? "tmux not found on daemon host"
+            ? `tmux not found${
+                snapshot?.tmuxExecLabel && snapshot.tmuxExecLabel !== "host"
+                  ? ` in ${snapshot.tmuxExecLabel}`
+                  : " on daemon host"
+              }`
             : snapshot
               ? `tmux · ${sessionName || "no session"}`
               : "tmux · loading…"}
         </Text>
         <Text style={tmuxMissing ? styles.danger : styles.muted}>
           {tmuxMissing
-            ? "install tmux or set tmuxPath"
+            ? "install tmux there or set tmuxPath / tmuxExec"
             : `${panes.length} pane${panes.length === 1 ? "" : "s"}` +
+              (snapshot?.tmuxExecLabel ? ` · ${snapshot.tmuxExecLabel}` : "") +
               (snapshot?.tmuxPath ? ` · ${snapshot.tmuxPath}` : "")}
         </Text>
       </View>
@@ -277,6 +284,9 @@ function TmuxPanelBody({
         {tmuxMissing ? (
           <Text style={styles.danger}>
             {missingText}
+            {snapshot && snapshot.tmuxExecLabel !== "host"
+              ? `\nNamespace: ${snapshot.tmuxExecLabel}`
+              : ""}
             {snapshot && snapshot.tmuxTried.length > 0
               ? `\nTried: ${snapshot.tmuxTried.join(", ")}`
               : ""}

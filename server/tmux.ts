@@ -46,8 +46,23 @@ export function tmuxCandidatePaths(home?: string): string[] {
   return out;
 }
 
-/** argv for resolving tmux through the login shell: `command -v tmux` → path or nothing. */
+/**
+ * argv for resolving tmux through the login shell: `command -v tmux` → path or
+ * nothing. The login shell is deliberate here: a desktop daemon inherits a PATH
+ * with no tmux directory, and only the login profile reveals where it lives.
+ */
 export const TMUX_WHICH_ARGS: readonly string[] = ["-lc", "command -v tmux"];
+
+/**
+ * argv for asking whether tmux is reachable in the environment the **agent**
+ * will actually get: no login shell, so nothing is added to PATH.
+ *
+ * These two probes must stay separate. Using the login shell for both was a
+ * real regression: the daemon found `/usr/bin/tmux` through the profile, the
+ * agent PATH still had no tmux, Amos' own `command -v tmux` failed, and no
+ * subagent pane was ever created.
+ */
+export const TMUX_REACHABLE_ARGS: readonly string[] = ["-c", "command -v tmux"];
 
 export function parsePathLookup(stdout: string): string | null {
   const first = (stdout ?? "")
@@ -146,7 +161,122 @@ export function prependToPath(
 
 /** What the panel and the log say when nothing resolved. Never a silent blank UI. */
 export const TMUX_MISSING_DETAIL =
-  "tmux not found on daemon host — install tmux or set tmuxPath";
+  "tmux not found in the agent's namespace — install tmux there or set tmuxPath";
+
+// ── namespace prefixes ──────────────────────────────────────────────────────
+
+/**
+ * A provider may run Pi somewhere the daemon cannot reach by exec'ing `tmux`
+ * directly: a container (`sbx exec … -- tmux`), a VM (`ssh host tmux`), a
+ * mount namespace (`nsenter … tmux`). The prefix is argv that must appear
+ * **before** the tmux binary, so every tmux operation - probe, new-session,
+ * display-message, capture, kill - lands in the same place the agent runs.
+ */
+export type ExecPrefix = readonly string[];
+
+export const PLACEHOLDER_CWD = "{cwd}";
+export const PLACEHOLDER_AGENT_ID = "{agentId}";
+
+export interface PrefixValues {
+  cwd: string;
+  agentId: string;
+}
+
+/** Substitute `{cwd}` / `{agentId}` in every prefix element. */
+export function applyExecPlaceholders(
+  prefix: readonly string[],
+  values: PrefixValues,
+): string[] {
+  return prefix.map((element) =>
+    element
+      .split(PLACEHOLDER_CWD)
+      .join(values.cwd)
+      .split(PLACEHOLDER_AGENT_ID)
+      .join(values.agentId),
+  );
+}
+
+/**
+ * Prefix precedence: an entry for this exact provider wins - including an
+ * explicit empty entry, which means "this provider runs tmux on the host" -
+ * otherwise the global `tmuxExec`, otherwise the host.
+ */
+export function resolveExecPrefix(input: {
+  provider: string;
+  providerTmuxExec?: Record<string, ExecPrefix | undefined>;
+  tmuxExec?: ExecPrefix;
+}): string[] {
+  const map = input.providerTmuxExec ?? {};
+  if (Object.prototype.hasOwnProperty.call(map, input.provider)) {
+    return [...(map[input.provider] ?? [])];
+  }
+  return [...(input.tmuxExec ?? [])];
+}
+
+/**
+ * Full argv for one tmux call: `[command, ...args]`. With an empty prefix this
+ * is exactly the pre-namespacing behaviour (`tmux <args>`), which keeps the
+ * host path byte-compatible.
+ */
+export function tmuxInvocation(
+  tmuxPath: string,
+  prefix: readonly string[],
+  args: readonly string[],
+): { command: string; args: string[] } {
+  if (prefix.length === 0) return { command: tmuxPath, args: [...args] };
+  return { command: prefix[0] as string, args: [...prefix.slice(1), tmuxPath, ...args] };
+}
+
+/** argv for the Paseo attach terminal (prefix + tmux + `attach -t <session>`). */
+export function attachInvocation(
+  tmuxPath: string,
+  prefix: readonly string[],
+  sessionName: string,
+): { command: string; args: string[] } {
+  return tmuxInvocation(tmuxPath, prefix, attachArgs(sessionName));
+}
+
+/** argv for `command -v tmux` and `<candidate> -V` inside the namespace. */
+export function shellProbeInvocation(
+  prefix: readonly string[],
+  command: string,
+  args: readonly string[],
+): { command: string; args: string[] } {
+  if (prefix.length === 0) return { command, args: [...args] };
+  return { command: prefix[0] as string, args: [...prefix.slice(1), command, ...args] };
+}
+
+/**
+ * Short human label for the panel/log: `sbx:pi-recovery-test` for
+ * `sbx exec -i -w {cwd} pi-recovery-test --`, `host` for no prefix.
+ */
+export function execLabel(prefix: readonly string[]): string {
+  if (prefix.length === 0) return "host";
+  const base = (element: string) => element.split("/").pop() ?? "";
+  const head = base(prefix[0] ?? "");
+  const tail =
+    prefix
+      .slice(1)
+      .filter((element) => !element.startsWith("-") && !element.includes("{") && base(element) !== head)
+      .pop() ?? "";
+  return tail ? `${head}:${tail}` : head || prefix.join(" ");
+}
+
+/**
+ * The tmux directory to prepend to the agent `PATH`, or null.
+ *
+ * Only when tmux is NOT already reachable inside the namespace: rewriting PATH
+ * for a container that already has tmux on its PATH is how the previous design
+ * broke agents, and inside a container the host directory would be nonsense
+ * anyway.
+ */
+export function tmuxDirToInject(resolution: {
+  path: string | null;
+  reachableInPath?: boolean;
+}): string | null {
+  if (resolution.reachableInPath !== false) return null;
+  return binaryDirOf(resolution.path);
+}
 
 export const DEFAULT_SESSION_PREFIX = "paseo-";
 export const DEFAULT_LAYOUT = "even-horizontal";
@@ -341,6 +471,15 @@ export function displaySocketPathCmd(): string[] {
   return ["display-message", "-p", "#{socket_path}"];
 }
 
+/**
+ * The tmux **server** pid as the namespace sees it. Inside a container the
+ * daemon's own pid is meaningless, and `TMUX` is parsed as
+ * `<socket>,<server pid>,<pane index>`, so ask the server where it runs.
+ */
+export function displayServerPidCmd(): string[] {
+  return ["display-message", "-p", "#{pid}"];
+}
+
 export const PANE_FORMAT =
   "#{pane_id}|#{pane_index}|#{pane_current_command}|#{pane_pid}|#{pane_title}|#{pane_width}|#{pane_height}|#{pane_active}";
 
@@ -410,6 +549,11 @@ export function parsePaneId(stdout: string): string | null {
   return isSafePaneId(value) ? value : null;
 }
 
+export function parseServerPid(stdout: string): number | null {
+  const value = (stdout ?? "").trim();
+  return /^[0-9]{1,9}$/.test(value) ? Number(value) : null;
+}
+
 export function parseSocketPath(stdout: string): string | null {
   const value = (stdout ?? "").trim();
   if (value.length === 0 || value.length > 512) return null;
@@ -431,6 +575,11 @@ export interface InjectedEnvOptions {
   /** Absolute path of the tmux the plugin resolved, so Amos can find `tmux`. */
   tmuxPath?: string | null;
   pathDelimiter?: string;
+  /**
+   * Prepend the tmux directory to PATH. Callers set this only when tmux is not
+   * already reachable inside the agent's namespace.
+   */
+  injectTmuxDir?: boolean;
 }
 
 /**
@@ -442,9 +591,10 @@ export function buildInjectedEnv(
   options: InjectedEnvOptions,
 ): Record<string, string> {
   // Amos runs `command -v tmux` inside the agent, so the agent must be able to
-  // find the same tmux the plugin resolved, even when the daemon's PATH has no
-  // directory for it.
-  const path = prependToPath(base.PATH, binaryDirOf(options.tmuxPath ?? null), options.pathDelimiter);
+  // find the same tmux the plugin resolved - but only when it cannot already
+  // find it, which is the normal case inside a container that ships tmux.
+  const dir = options.injectTmuxDir === false ? null : binaryDirOf(options.tmuxPath ?? null);
+  const path = prependToPath(base.PATH, dir, options.pathDelimiter);
   return {
     ...(options.stripAmosIdentity === false ? base : stripAmosIdentity(base)),
     ...(path === undefined ? {} : { PATH: path }),
@@ -468,9 +618,11 @@ export function buildTmuxUnavailableEnv(
     stripAmosIdentity?: boolean;
     tmuxPath?: string | null;
     pathDelimiter?: string;
+    injectTmuxDir?: boolean;
   },
 ): Record<string, string> {
-  const path = prependToPath(base.PATH, binaryDirOf(options.tmuxPath ?? null), options.pathDelimiter);
+  const dir = options.injectTmuxDir === false ? null : binaryDirOf(options.tmuxPath ?? null);
+  const path = prependToPath(base.PATH, dir, options.pathDelimiter);
   return {
     ...(options.stripAmosIdentity === false ? base : stripAmosIdentity(base)),
     ...(path === undefined ? {} : { PATH: path }),
@@ -504,6 +656,8 @@ export interface EnsureSessionOptions {
 export interface SessionHandle {
   paneId: string;
   socketPath: string;
+  /** tmux server pid as reported inside the namespace; null when unknown. */
+  serverPid: number | null;
   created: boolean;
 }
 
@@ -587,7 +741,11 @@ export class TmuxClient {
       return { ok: false, stage: "socket", message: socketRes.stderr || "no tmux socket path" };
     }
 
-    return { ok: true, handle: { paneId, socketPath, created } };
+    // Best effort: a namespace may hide the pid, and Amos does not validate it.
+    const pidRes = await this.run(displayServerPidCmd());
+    const serverPid = parseServerPid(pidRes.stdout);
+
+    return { ok: true, handle: { paneId, socketPath, serverPid, created } };
   }
 
   async sessionExists(name: string): Promise<boolean> {

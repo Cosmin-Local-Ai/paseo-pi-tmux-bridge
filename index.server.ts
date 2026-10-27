@@ -27,22 +27,29 @@ import {
   SESSION_ENV_KEY,
   SESSION_ROWS,
   SHELL_READY_ENV_KEY,
-  TMUX_BIN,
   TMUX_MISSING_DETAIL,
+  TMUX_REACHABLE_ARGS,
   TMUX_WHICH_ARGS,
-  attachArgs,
+  applyExecPlaceholders,
+  attachInvocation,
   attachTerminalName,
   buildInjectedEnv,
   buildTmuxUnavailableEnv,
+  execLabel,
   isOwnSessionName,
   parsePathLookup,
   pathBaseFor,
+  resolveExecPrefix,
   resolvePlaceholderCommand,
   resolveTmuxPath,
   sessionNameFor,
   shouldHandleSessionOpen,
+  shellProbeInvocation,
   tmuxCandidatePaths,
+  tmuxDirToInject,
+  tmuxInvocation,
 } from "./server/tmux.ts";
+import type { PrefixValues, TmuxRunResult } from "./server/tmux.ts";
 import type { TmuxClient as TmuxClientType, TmuxRun } from "./server/tmux.ts";
 import { TmuxClient } from "./server/tmux.ts";
 
@@ -86,11 +93,23 @@ export default function contribute(server: PluginServerContext): () => void {
   // Set once the host tears the plugin down: the daemon IPC channel is closed
   // from then on, so any Paseo call would throw "Daemon client closed".
   let stopped = false;
-  // Absolute tmux path resolved once per plugin instance (re-resolved when the
-  // settings change). `tmuxBin` is what every tmux invocation actually runs.
-  let tmuxBin = TMUX_BIN;
-  let resolution: { path: string | null; tried: string[] } | null = null;
-  let resolutionInFlight: Promise<{ path: string | null; tried: string[] }> | null = null;
+  /**
+   * Where tmux lives for one provider: the absolute binary **plus** the argv
+   * prefix that reaches the namespace the agent runs in. Cached per provider id
+   * ("" = the global default) and re-resolved when the settings change.
+   */
+  interface TmuxTarget {
+    provider: string;
+    path: string | null;
+    tried: string[];
+    /** raw prefix, placeholders still present; substituted per call */
+    prefix: string[];
+    label: string;
+    /** tmux survives in the agent PATH inside the namespace (undefined = unknown) */
+    reachableInPath?: boolean;
+  }
+  const targets = new Map<string, TmuxTarget>();
+  const targetsInFlight = new Map<string, Promise<TmuxTarget>>();
   const settingsHandle = server.registerSettings(bridgeSettings);
 
   // `schema.parse({})` yields the declared defaults, so there is one source of
@@ -99,10 +118,16 @@ export default function contribute(server: PluginServerContext): () => void {
   let settingsCache: BridgeSettings | null = defaultSettings;
   const unsubscribeSettings = settingsHandle.subscribe((state) => {
     if (state.status !== "ready") return;
-    if (settingsCache && settingsCache.tmuxPath !== state.values.tmuxPath) {
-      // A tmuxPath override changed: throw the cached resolution away.
-      resolution = null;
-      resolutionInFlight = null;
+    const previous = settingsCache;
+    if (
+      previous &&
+      (previous.tmuxPath !== state.values.tmuxPath ||
+        JSON.stringify(previous.tmuxExec) !== JSON.stringify(state.values.tmuxExec) ||
+        JSON.stringify(previous.providerTmuxExec) !== JSON.stringify(state.values.providerTmuxExec))
+    ) {
+      // tmuxPath / prefix changed: throw the cached resolutions away.
+      targets.clear();
+      targetsInFlight.clear();
     }
     settingsCache = state.values;
   });
@@ -129,74 +154,189 @@ export default function contribute(server: PluginServerContext): () => void {
     return settingsCache ?? defaultSettings;
   }
 
-  /**
-   * Resolve a usable tmux. A desktop daemon frequently starts with a PATH that
-   * has no tmux directory, so `tmux` by name fails even when tmux is installed;
-   * the user then sees a plugin that "does nothing". Probe order: the explicit
-   * `tmuxPath` setting, `command -v tmux`, then a fixed candidate list. The
-   * result is cached and every call - including the attach terminal's own
-   * command - uses the absolute path.
-   */
-  async function resolveTmux(signal?: AbortSignal): Promise<{ path: string | null; tried: string[] }> {
-    if (resolution) return resolution;
-    if (resolutionInFlight) return resolutionInFlight;
-    resolutionInFlight = (async () => {
-      const settings = await currentSettings();
-      const configured = typeof settings.tmuxPath === "string" ? settings.tmuxPath.trim() : "";
-      const candidates = tmuxCandidatePaths(process.env.HOME);
-      let pathLookup: string | null = null;
-      if (configured.length === 0) {
-        try {
-          const probed = await execCommand("/bin/sh", [...TMUX_WHICH_ARGS], {
-            timeout: 5000,
-            signal,
-          });
-          pathLookup = parsePathLookup(probed.stdout);
-        } catch {
-          pathLookup = null;
-        }
-      }
-      // Prove executability by running `<candidate> -V` rather than trusting that
-      // a path exists: a stale symlink or a non-executable file must not win.
-      const usable = new Set<string>();
-      const toProbe =
-        configured.length > 0 ? [configured] : [...(pathLookup ? [pathLookup] : []), ...candidates];
-      for (const candidate of toProbe) {
-        if (usable.has(candidate)) continue;
-        try {
-          await execCommand(candidate, ["-V"], { timeout: 5000, signal });
-          usable.add(candidate);
-        } catch {
-          // not here, try the next one
-        }
-      }
-      const resolved = resolveTmuxPath({ configured, pathLookup, candidates }, (c) =>
-        usable.has(c),
-      );
-      resolution = resolved;
-      if (resolved.path) tmuxBin = resolved.path;
-      log(
-        resolved.path
-          ? `tmux resolved to ${resolved.path}`
-          : `${TMUX_MISSING_DETAIL}; tried: ${resolved.tried.join(", ")}`,
-      );
-      return resolved;
-    })().finally(() => {
-      resolutionInFlight = null;
-    });
-    return resolutionInFlight;
-  }
-
   /** True when the host's Paseo session is gone (reload, shutdown, restart). */
   function channelGone(error: unknown): boolean {
     return stopped || /daemon client closed|client closed|channel closed/i.test(describeError(error));
   }
 
-  const runTmux =
-    (signal?: AbortSignal): TmuxRun =>
+  /** Run one argv through a namespace prefix and normalise the failure shape. */
+  async function execThrough(
+    prefix: readonly string[],
+    command: string,
+    args: readonly string[],
+    options?: { timeout?: number; signal?: AbortSignal },
+  ): Promise<TmuxRunResult> {
+    const invocation = shellProbeInvocation(prefix, command, args);
+    try {
+      const result = await execCommand(invocation.command, invocation.args, {
+        timeout: options?.timeout ?? 15000,
+        maxBuffer: 8 * 1024 * 1024,
+        signal: options?.signal,
+      });
+      return { ok: true, stdout: result.stdout, stderr: result.stderr };
+    } catch (error) {
+      const failure = error as { stdout?: unknown; stderr?: unknown };
+      const stderr =
+        typeof failure.stderr === "string" && failure.stderr.trim().length > 0
+          ? failure.stderr.trim()
+          : describeError(error);
+      return {
+        ok: false,
+        stdout: typeof failure.stdout === "string" ? failure.stdout : "",
+        stderr,
+      };
+    }
+  }
+
+  /**
+   * Resolve the tmux for one provider, **inside the namespace that provider's
+   * agents run in**. A desktop daemon often has no tmux directory on PATH, and a
+   * sandboxed provider has no host tmux at all, so a host-only lookup produced
+   * sessions the agent could not reach. Probe order, all through the prefix:
+   * `tmuxPath`, `command -v tmux`, then the fixed candidate list; each candidate
+   * is proven by running `<candidate> -V`.
+   */
+  async function resolveTmuxFor(
+    provider: string,
+    values: PrefixValues,
+    signal?: AbortSignal,
+  ): Promise<TmuxTarget> {
+    const cached = targets.get(provider);
+    if (cached) return cached;
+    const pending = targetsInFlight.get(provider);
+    if (pending) return pending;
+    const work = (async () => {
+      const settings = await currentSettings();
+      const rawPrefix = resolveExecPrefix({
+        provider,
+        providerTmuxExec: settings.providerTmuxExec,
+        tmuxExec: settings.tmuxExec,
+      });
+      const prefix = applyExecPlaceholders(rawPrefix, values);
+      const label = execLabel(prefix);
+      const configured = typeof settings.tmuxPath === "string" ? settings.tmuxPath.trim() : "";
+      const candidates = tmuxCandidatePaths(process.env.HOME);
+      const which = await execThrough(prefix, "/bin/sh", [...TMUX_WHICH_ARGS], {
+        timeout: 8000,
+        signal,
+      });
+      const pathLookup = which.ok ? parsePathLookup(which.stdout) : null;
+      // Whether tmux survives in the agent's own PATH is a separate question:
+      // a login shell would answer it wrongly by restoring the profile PATH.
+      const reachable = await execThrough(prefix, "/bin/sh", [...TMUX_REACHABLE_ARGS], {
+        timeout: 8000,
+        signal,
+      });
+      const reachableInPath = reachable.ok && parsePathLookup(reachable.stdout) !== null;
+      const usable = new Set<string>();
+      const toProbe =
+        configured.length > 0 ? [configured] : [...(pathLookup ? [pathLookup] : []), ...candidates];
+      for (const candidate of toProbe) {
+        if (usable.has(candidate)) continue;
+        const probed = await execThrough(prefix, candidate, ["-V"], { timeout: 8000, signal });
+        if (probed.ok) usable.add(candidate);
+      }
+      const resolved = resolveTmuxPath({ configured, pathLookup, candidates }, (c) =>
+        usable.has(c),
+      );
+      const target: TmuxTarget = {
+        provider,
+        path: resolved.path,
+        tried: resolved.tried,
+        prefix: rawPrefix,
+        label,
+        reachableInPath,
+      };
+      targets.set(provider, target);
+      log(
+        target.path
+          ? `tmux resolved to ${target.path} (${label})`
+          : `${TMUX_MISSING_DETAIL} (${label}); tried: ${target.tried.join(", ")}`,
+      );
+      return target;
+    })().finally(() => {
+      targetsInFlight.delete(provider);
+    });
+    targetsInFlight.set(provider, work);
+    return work;
+  }
+
+  /** A target pinned to what the record says the session was created in. */
+  function pinnedTarget(agentId: string): TmuxTarget | null {
+    const record = bookkeeping.get(agentId);
+    if (!record || !record.tmuxPath) return null;
+    return {
+      provider: record.provider,
+      path: record.tmuxPath,
+      tried: [],
+      prefix: record.tmuxPrefix,
+      label: record.tmuxLabel,
+      // Unknown: a pinned target only ever runs tmux, it never builds agent env.
+      reachableInPath: undefined,
+    };
+  }
+
+  /**
+   * Target for an RPC or a cleanup call. Prefers the namespace recorded when the
+   * session was created; after a plugin reload (empty map) it falls back to the
+   * configured prefixes and keeps the first one that actually has the session.
+   */
+  async function targetForAgent(
+    agentId: string,
+    sessionName: string,
+    signal?: AbortSignal,
+  ): Promise<{ target: TmuxTarget; triedLabels: string[] }> {
+    const pinned = pinnedTarget(agentId);
+    const settings = await currentSettings();
+    const values = valuesFor(agentId, settings.sessionPrefix);
+    if (pinned) return { target: pinned, triedLabels: [pinned.label] };
+    const providers = ["", ...Object.keys(settings.providerTmuxExec ?? {})];
+    let fallback: TmuxTarget | null = null;
+    const triedLabels: string[] = [];
+    for (const provider of providers) {
+      const target = await resolveTmuxFor(provider, values, signal);
+      if (!target.path) continue;
+      if (!fallback) fallback = target;
+      if (!triedLabels.includes(target.label)) triedLabels.push(target.label);
+      if (await tmuxFor(target, values, signal).sessionExists(sessionName)) {
+        bookkeeping.rememberOpened({
+          agentId,
+          sessionName,
+          workspaceId: bookkeeping.get(agentId)?.workspaceId ?? null,
+          cwd: bookkeeping.get(agentId)?.cwd ?? "",
+          provider: target.provider,
+          tmuxPath: target.path,
+          tmuxPrefix: target.prefix,
+          tmuxLabel: target.label,
+        });
+        return { target, triedLabels };
+      }
+    }
+    const last = fallback ?? (await resolveTmuxFor("", values, signal));
+    if (!triedLabels.includes(last.label)) triedLabels.push(last.label);
+    return { target: last, triedLabels };
+  }
+
+  function valuesFor(agentId: string, sessionPrefix: string): PrefixValues {
+    const record = bookkeeping.get(agentId);
+    const derived = sessionNameFor(sessionPrefix, agentId);
+    return {
+      cwd: record?.cwd && derived === record.sessionName ? record.cwd : process.cwd(),
+      agentId,
+    };
+  }
+
+  const runTmuxFor =
+    (target: TmuxTarget, values: PrefixValues, signal?: AbortSignal): TmuxRun =>
     async (args) => {
+      if (!target.path) return { ok: false, stdout: "", stderr: TMUX_MISSING_DETAIL };
+      const invocation = tmuxInvocation(
+        target.path,
+        applyExecPlaceholders(target.prefix, values),
+        args,
+      );
       try {
-        const result = await execCommand(tmuxBin, args, {
+        const result = await execCommand(invocation.command, invocation.args, {
           timeout: 15000,
           maxBuffer: 8 * 1024 * 1024,
           signal,
@@ -216,7 +356,11 @@ export default function contribute(server: PluginServerContext): () => void {
       }
     };
 
-  const tmuxFor = (signal?: AbortSignal): TmuxClientType => new TmuxClient(runTmux(signal));
+  const tmuxFor = (
+    target: TmuxTarget,
+    values: PrefixValues,
+    signal?: AbortSignal,
+  ): TmuxClientType => new TmuxClient(runTmuxFor(target, values, signal));
 
   // ── attach terminal ───────────────────────────────────────────────────────
 
@@ -226,6 +370,8 @@ export default function contribute(server: PluginServerContext): () => void {
     workspaceId: string,
     cwd: string,
     sessionName: string,
+    target: TmuxTarget,
+    values: PrefixValues,
   ): Promise<string | null> {
     if (stopped) return null;
     const name = attachTerminalName(agentId);
@@ -258,19 +404,28 @@ export default function contribute(server: PluginServerContext): () => void {
       log(`terminal list failed for ${agentId}: ${describeError(error)}`);
     }
 
-    // The terminal process inherits the daemon environment, so it must run the
-    // resolved absolute tmux too, not `tmux` by name.
-    const resolved = await resolveTmux();
+    // Paseo spawns the terminal with the daemon's environment, so the command is
+    // the resolved tmux **through the same prefix** - otherwise the tab shows a
+    // host session the agent cannot reach, or fails outright in a container.
+    if (!target.path) return null;
+    const invocation = attachInvocation(
+      target.path,
+      applyExecPlaceholders(target.prefix, values),
+      sessionName,
+    );
     const handle = await paseo.terminals.create({
       workspaceId,
       cwd,
       name,
-      command: resolved.path ?? TMUX_BIN,
-      args: attachArgs(sessionName),
+      command: invocation.command,
+      args: invocation.args,
       size: { rows: ATTACH_TERMINAL_ROWS, cols: ATTACH_TERMINAL_COLS },
     });
     bookkeeping.rememberTerminal(agentId, handle.id, name);
-    log(`opened attach terminal ${handle.id} for agent ${agentId} (${sessionName})`);
+    log(
+      `opened attach terminal ${handle.id} for agent ${agentId} (${sessionName}, ${target.label}): ` +
+        `${invocation.command} ${invocation.args.join(" ")}`,
+    );
     return handle.id;
   }
 
@@ -282,12 +437,22 @@ export default function contribute(server: PluginServerContext): () => void {
     paseo: Paseo,
     request: PluginSessionOpenRequest,
     sessionName: string,
+    target: TmuxTarget,
+    values: PrefixValues,
   ): void {
     if (stopped || request.workspaceId === null) return;
     if (!bookkeeping.beginTerminal(request.agentId)) return;
     const workspaceId = request.workspaceId;
     const timer = setTimeout(() => {
-      void ensureAttachTerminal(paseo, request.agentId, workspaceId, request.cwd, sessionName)
+      void ensureAttachTerminal(
+        paseo,
+        request.agentId,
+        workspaceId,
+        request.cwd,
+        sessionName,
+        target,
+        values,
+      )
         .catch((error: unknown) => {
           if (channelGone(error)) return;
           log(`attach terminal failed for ${request.agentId}: ${describeError(error)}`);
@@ -334,19 +499,22 @@ export default function contribute(server: PluginServerContext): () => void {
         return { ...request, env: buildTmuxUnavailableEnv(baseEnv, settings) };
       }
 
-      const resolved = await resolveTmux(context.signal);
-      const tmux = tmuxFor(context.signal);
-      if (!resolved.path) {
+      const values: PrefixValues = { cwd: request.cwd, agentId: request.agentId };
+      const target = await resolveTmuxFor(request.provider, values, context.signal);
+      const tmux = tmuxFor(target, values, context.signal);
+      if (!target.path) {
         log(
           `${TMUX_MISSING_DETAIL}; agent ${request.agentId} gets an empty TMUX. ` +
-            `Tried: ${resolved.tried.join(", ")}. Set tmuxPath to the absolute path if tmux ` +
-            `lives somewhere else on this host.`,
+            `Namespace: ${target.label}. Tried: ${target.tried.join(", ")}. Set tmuxPath to the ` +
+            `absolute path inside that namespace, or tmuxExec/providerTmuxExec if tmux must be ` +
+            `reached through a wrapper.`,
         );
         return {
           ...request,
           env: buildTmuxUnavailableEnv(baseEnv, {
             ...settings,
-            tmuxPath: resolved.path,
+            tmuxPath: target.path,
+            injectTmuxDir: false,
           }),
         };
       }
@@ -365,34 +533,44 @@ export default function contribute(server: PluginServerContext): () => void {
         return { ...request, env: buildTmuxUnavailableEnv(baseEnv, settings) };
       }
 
+      // A fresh session means a fresh lifecycle: cleanup must be allowed again.
+      cleanedUp.delete(request.agentId);
+
       bookkeeping.rememberOpened({
         agentId: request.agentId,
         sessionName,
         workspaceId: request.workspaceId,
         cwd: request.cwd,
+        provider: target.provider,
+        tmuxPath: target.path,
+        tmuxPrefix: target.prefix,
+        tmuxLabel: target.label,
       });
 
       log(
-        `agent ${request.agentId} (${request.reason}) -> tmux ${sessionName} ` +
+        `agent ${request.agentId} (${request.reason}) -> tmux ${sessionName} in ${target.label} ` +
           `pane ${ensured.handle.paneId}${ensured.handle.created ? " (created)" : " (reused)"}`,
       );
 
       if (settings.autoAttachTerminal) {
-        scheduleAttachTerminal(context.paseo, request, sessionName);
+        scheduleAttachTerminal(context.paseo, request, sessionName, target, values);
       }
 
+      // Only prepend a tmux directory when tmux is not already reachable inside
+      // that namespace; a container that ships tmux needs no PATH rewrite, and
+      // a host directory would be meaningless there.
+      const injectDir = tmuxDirToInject(target);
       return {
         ...request,
         env: buildInjectedEnv(baseEnv, {
           socketPath: ensured.handle.socketPath,
-          pid: process.pid,
+          pid: ensured.handle.serverPid ?? process.pid,
           paneId: ensured.handle.paneId,
           sessionName,
           shellReadyDelayMs: settings.shellReadyDelayMs,
           stripAmosIdentity: settings.stripAmosIdentity,
-          // The agent must be able to run `tmux` itself (Amos checks
-          // `command -v tmux`), so hand it the directory we resolved to.
-          tmuxPath: resolved.path,
+          tmuxPath: target.path,
+          injectTmuxDir: injectDir !== null,
         }),
       };
     } catch (error) {
@@ -404,12 +582,21 @@ export default function contribute(server: PluginServerContext): () => void {
 
   // ── cleanup ──────────────────────────────────────────────────────────────
 
+  /**
+   * Agent ids already cleaned up in this plugin instance. `agent.closed` and
+   * `agent.archived` both fire for one archive, and a second pass would kill an
+   * already-dead terminal and report a bogus tmux failure.
+   */
+  const cleanedUp = new Set<string>();
+
   async function handleAgentGone(
     paseo: Paseo,
     agentId: string,
     reason: "closed" | "archived",
   ): Promise<void> {
     if (stopped) return;
+    if (cleanedUp.has(agentId)) return;
+    cleanedUp.add(agentId);
     try {
       const settings = await currentSettings();
       const record = bookkeeping.get(agentId);
@@ -455,18 +642,25 @@ export default function contribute(server: PluginServerContext): () => void {
         return;
       }
 
-      const tmux = tmuxFor();
-      if (!(await resolveTmux()).path) {
+      // Cleanup must use the namespace the session was created in, which the
+      // record carries; after a reload the prefixes are re-probed instead.
+      const { target, triedLabels } = await targetForAgent(agentId, sessionName);
+      if (!target.path) {
+        log(`${TMUX_MISSING_DETAIL}; nothing to kill for ${agentId} (tried: ${target.tried.join(", ")})`);
         bookkeeping.forget(agentId);
         return;
       }
+      const tmux = tmuxFor(target, valuesFor(agentId, settings.sessionPrefix));
       if (!(await tmux.sessionExists(sessionName))) {
+        // Not an error: the agent may never have had a session. Saying so keeps a
+        // leaked session diagnosable instead of silent.
+        log(`no tmux session ${sessionName} in ${triedLabels.join(", ")}; nothing to kill`);
         bookkeeping.forget(agentId);
         return;
       }
 
       const result = await tmux.killSession(sessionName);
-      if (result.ok) log(`killed tmux session ${sessionName} (${reason})`);
+      if (result.ok) log(`killed tmux session ${sessionName} in ${target.label} (${reason})`);
       else log(`tmux kill-session ${sessionName} failed: ${result.stderr}`);
 
       bookkeeping.forget(agentId);
@@ -485,21 +679,30 @@ export default function contribute(server: PluginServerContext): () => void {
   // ── RPC ──────────────────────────────────────────────────────────────────
 
   async function sessionFor(agentId: string): Promise<{ settings: BridgeSettings; name: string | null }> {
-    // Every RPC runs tmux through the resolved absolute path, even when no
-    // agent.session_open happened in this plugin instance.
-    void resolveTmux();
     const settings = await currentSettings();
     return { settings, name: sessionNameFor(settings.sessionPrefix, agentId) };
   }
 
+  /** tmux client for an RPC, in the namespace the agent's session lives in. */
+  async function clientForAgent(agentId: string, sessionName: string) {
+    const settings = await currentSettings();
+    const { target } = await targetForAgent(agentId, sessionName);
+    const values = valuesFor(agentId, settings.sessionPrefix);
+    return { target, values, tmux: tmuxFor(target, values) };
+  }
+
+  /** What namespace the panel should report. */
+  function namespaceFields(target: TmuxTarget) {
+    return {
+      tmuxAvailable: Boolean(target.path),
+      tmuxPath: target.path ?? "",
+      tmuxExecLabel: target.label,
+      tmuxTried: target.tried,
+    };
+  }
+
   server.handle(sessionStatusRpc, async (input) => {
     const { name } = await sessionFor(input.agentId);
-    const resolved = await resolveTmux();
-    const unavailable = {
-      tmuxAvailable: Boolean(resolved.path),
-      tmuxPath: resolved.path ?? "",
-      tmuxTried: resolved.tried,
-    };
     if (!name) {
       return {
         agentId: input.agentId,
@@ -510,11 +713,16 @@ export default function contribute(server: PluginServerContext): () => void {
         terminalId: null,
         workspaceId: null,
         cwd: null,
-        ...unavailable,
+        tmuxAvailable: false,
+        tmuxPath: "",
+        tmuxExecLabel: "host",
+        tmuxTried: [],
         detail: "agent id is not usable as a tmux session name",
       };
     }
-    if (!resolved.path) {
+    const { target, tmux } = await clientForAgent(input.agentId, name);
+    const unavailable = namespaceFields(target);
+    if (!target.path) {
       return {
         agentId: input.agentId,
         sessionName: name,
@@ -529,8 +737,8 @@ export default function contribute(server: PluginServerContext): () => void {
       };
     }
     const record = bookkeeping.get(input.agentId);
-    const exists = await tmuxFor().sessionExists(name);
-    const panes = exists ? await tmuxFor().listPanes(name) : [];
+    const exists = await tmux.sessionExists(name);
+    const panes = exists ? await tmux.listPanes(name) : [];
     return {
       agentId: input.agentId,
       sessionName: name,
@@ -546,23 +754,22 @@ export default function contribute(server: PluginServerContext): () => void {
 
   server.handle(listPanesRpc, async (input) => {
     const { name } = await sessionFor(input.agentId);
-    const resolved = await resolveTmux();
-    const unavailable = {
-      tmuxAvailable: Boolean(resolved.path),
-      tmuxPath: resolved.path ?? "",
-      tmuxTried: resolved.tried,
-    };
     if (!name) {
       return {
         agentId: input.agentId,
         sessionName: "",
         exists: false,
         panes: [],
-        ...unavailable,
+        tmuxAvailable: false,
+        tmuxPath: "",
+        tmuxExecLabel: "host",
+        tmuxTried: [],
         detail: "agent id is not usable as a tmux session name",
       };
     }
-    if (!resolved.path) {
+    const { target, tmux } = await clientForAgent(input.agentId, name);
+    const unavailable = namespaceFields(target);
+    if (!target.path) {
       return {
         agentId: input.agentId,
         sessionName: name,
@@ -572,7 +779,6 @@ export default function contribute(server: PluginServerContext): () => void {
         detail: TMUX_MISSING_DETAIL,
       };
     }
-    const tmux = tmuxFor();
     const exists = await tmux.sessionExists(name);
     const panes = exists ? await tmux.listPanes(name) : [];
     return { agentId: input.agentId, sessionName: name, exists, panes, ...unavailable };
@@ -581,18 +787,16 @@ export default function contribute(server: PluginServerContext): () => void {
   server.handle(capturePaneRpc, async (input) => {
     const { settings, name } = await sessionFor(input.agentId);
     if (!name) return { paneId: input.paneId, text: "", lines: 0, detail: "unknown agent" };
-    if (!(await tmuxFor().sessionExists(name))) {
+    const { tmux } = await clientForAgent(input.agentId, name);
+    if (!(await tmux.sessionExists(name))) {
       return { paneId: input.paneId, text: "", lines: 0, detail: `no tmux session ${name}` };
     }
     // The pane must belong to this agent's session, not merely to the server.
-    const panes = await tmuxFor().listPanes(name);
+    const panes = await tmux.listPanes(name);
     if (!panes.some((pane) => pane.paneId === input.paneId)) {
       return { paneId: input.paneId, text: "", lines: 0, detail: "pane is not in this agent's session" };
     }
-    const result = await tmuxFor().capturePane(
-      input.paneId,
-      input.lines ?? settings.paneCaptureLines,
-    );
+    const result = await tmux.capturePane(input.paneId, input.lines ?? settings.paneCaptureLines);
     if (!result.ok) return { paneId: input.paneId, text: "", lines: 0, detail: result.stderr };
     const text = result.stdout.replace(/\s+$/u, "");
     return { paneId: input.paneId, text, lines: text.length === 0 ? 0 : text.split("\n").length };
@@ -601,22 +805,24 @@ export default function contribute(server: PluginServerContext): () => void {
   server.handle(selectPaneRpc, async (input) => {
     const { name } = await sessionFor(input.agentId);
     if (!name) return { ok: false, paneId: input.paneId, detail: "unknown agent" };
-    const panes = await tmuxFor().listPanes(name);
+    const { tmux } = await clientForAgent(input.agentId, name);
+    const panes = await tmux.listPanes(name);
     if (!panes.some((pane) => pane.paneId === input.paneId)) {
       return { ok: false, paneId: input.paneId, detail: "pane is not in this agent's session" };
     }
-    const result = await tmuxFor().selectPane(input.paneId);
+    const result = await tmux.selectPane(input.paneId);
     return { ok: result.ok, paneId: input.paneId, detail: result.ok ? undefined : result.stderr };
   });
 
   server.handle(killPaneRpc, async (input) => {
     const { name } = await sessionFor(input.agentId);
     if (!name) return { ok: false, paneId: input.paneId, detail: "unknown agent" };
-    const panes = await tmuxFor().listPanes(name);
+    const { tmux } = await clientForAgent(input.agentId, name);
+    const panes = await tmux.listPanes(name);
     if (!panes.some((pane) => pane.paneId === input.paneId)) {
       return { ok: false, paneId: input.paneId, detail: "pane is not in this agent's session" };
     }
-    const result = await tmuxFor().killPane(input.paneId);
+    const result = await tmux.killPane(input.paneId);
     return { ok: result.ok, paneId: input.paneId, detail: result.ok ? undefined : result.stderr };
   });
 
@@ -649,7 +855,16 @@ export default function contribute(server: PluginServerContext): () => void {
         detail: "this agent has no workspace, so no terminal can be opened",
       };
     }
-    const terminalId = await ensureAttachTerminal(context.paseo, input.agentId, workspaceId, cwd, name);
+    const { target, values } = await clientForAgent(input.agentId, name);
+    const terminalId = await ensureAttachTerminal(
+      context.paseo,
+      input.agentId,
+      workspaceId,
+      cwd,
+      name,
+      target,
+      values,
+    );
     return { ok: Boolean(terminalId), terminalId, sessionName: name };
   });
 

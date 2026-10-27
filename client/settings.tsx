@@ -62,6 +62,64 @@ function NumberField({
   );
 }
 
+/**
+ * JSON-shaped setting (argv prefix, provider map). Held in a draft and saved
+ * explicitly: half-typed JSON would be rejected by the schema on every key.
+ */
+function JsonField({
+  label,
+  hint,
+  value,
+  settings,
+  kind,
+  onCommit,
+}: {
+  label: string;
+  hint: string;
+  value: unknown;
+  settings: Ready;
+  kind: "array" | "object";
+  onCommit(value: unknown): void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
+  const shown = draft ?? JSON.stringify(value);
+  const commit = useCallback(() => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(shown);
+    } catch {
+      setParseError(`Not valid JSON. Example: ${kind === "array" ? '["sbx","exec","ctr","--"]' : '{"pi-recovery":["sbx","exec","ctr","--"]}'}`);
+      return;
+    }
+    const ok = kind === "array" ? Array.isArray(parsed) : parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+    if (!ok) {
+      setParseError(`Expected a JSON ${kind}.`);
+      return;
+    }
+    setParseError(null);
+    onCommit(parsed);
+  }, [kind, onCommit, shown]);
+  return (
+    <>
+      <SettingsInput
+        label={label}
+        hint={hint}
+        initialValue={shown}
+        onChangeText={setDraft}
+        disabled={settings.saving}
+        error={parseError ?? settings.saveError}
+      />
+      <SettingsAction
+        label={label}
+        actionLabel="Save JSON"
+        disabled={settings.saving || draft === null}
+        onPress={commit}
+      />
+    </>
+  );
+}
+
 function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfaceProps["theme"] }) {
   const style = useMemo(() => ({ color: theme.colors.foreground }), [theme]);
   const values = settings.values;
@@ -124,6 +182,44 @@ function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfacePr
         />
       </SettingsCard>
       <SettingsCard>
+        <SettingsInput
+          label="tmux path"
+          hint="Absolute path to tmux inside the namespace it runs in. Empty = probe. Set = authoritative."
+          initialValue={values.tmuxPath}
+          onChangeText={(tmuxPath) => patch({ tmuxPath })}
+          disabled={settings.saving}
+          error={settings.saveError}
+        />
+        <JsonField
+          label="tmux exec prefix"
+          hint={
+            'argv before tmux for every call, e.g. ["sbx","exec","-i","-w","{cwd}","ctr","--"]. Placeholders: {cwd}, {agentId}. Empty = daemon host.'
+          }
+          value={values.tmuxExec}
+          kind="array"
+          settings={settings}
+          onCommit={(tmuxExec) => patch({ tmuxExec: tmuxExec as Ready["values"]["tmuxExec"] })}
+        />
+        <JsonField
+          label="provider exec prefixes"
+          hint='Per-provider map, wins over the global prefix: {"pi-recovery":["sbx","exec","ctr","--"]}. An explicit [] pins that provider to the host.'
+          value={values.providerTmuxExec}
+          kind="object"
+          settings={settings}
+          onCommit={(providerTmuxExec) =>
+            patch({ providerTmuxExec: providerTmuxExec as Ready["values"]["providerTmuxExec"] })
+          }
+        />
+        <JsonField
+          label="extra Pi provider ids"
+          hint='Providers to treat as Pi even when the name heuristic cannot see them: ["my-pi-wrapper"].'
+          value={values.piProviders}
+          kind="array"
+          settings={settings}
+          onCommit={(piProviders) => patch({ piProviders: piProviders as Ready["values"]["piProviders"] })}
+        />
+      </SettingsCard>
+      <SettingsCard>
         <NumberField
           label="Shell ready delay (ms)"
           hint="Written to PI_SUBAGENT_SHELL_READY_DELAY_MS; Amos defaults to 500."
@@ -148,6 +244,10 @@ function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfacePr
           <Text style={style}>
             placeholder {values.placeholderCmd} · delay {values.shellReadyDelayMs}ms · capture{" "}
             {values.paneCaptureLines} lines
+          </Text>
+          <Text style={style}>
+            tmux {values.tmuxPath || "(probed)"} · exec {JSON.stringify(values.tmuxExec)} · per
+            provider {JSON.stringify(values.providerTmuxExec)}
           </Text>
         </View>
       </SettingsRow>

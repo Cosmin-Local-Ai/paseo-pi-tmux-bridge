@@ -12,13 +12,17 @@ import {
   SESSION_ENV_KEY,
   SHELL_READY_ENV_KEY,
   TmuxClient,
+  applyExecPlaceholders,
   attachArgs,
+  attachInvocation,
   attachTerminalName,
   buildInjectedEnv,
   buildTmuxUnavailableEnv,
   capturePaneCmd,
   displayPaneIdCmd,
+  displayServerPidCmd,
   displaySocketPathCmd,
+  execLabel,
   hasSessionCmd,
   isOwnSessionName,
   isSafeAgentId,
@@ -32,17 +36,24 @@ import {
   parsePaneId,
   parsePaneRows,
   parsePathLookup,
+  parseServerPid,
   parseSocketPath,
   pathBaseFor,
   prependToPath,
   binaryDirOf,
+  resolveExecPrefix,
   resolvePlaceholderCommand,
   resolveTmuxPath,
+  shellProbeInvocation,
   selectLayoutCmd,
   selectPaneCmd,
   sessionNameFor,
   shouldHandleSessionOpen,
   tmuxCandidatePaths,
+  TMUX_REACHABLE_ARGS,
+  TMUX_WHICH_ARGS,
+  tmuxDirToInject,
+  tmuxInvocation,
   TMUX_CANDIDATE_PATHS,
   TMUX_MISSING_DETAIL,
 } from "../server/tmux.ts";
@@ -739,4 +750,175 @@ test("fail-soft env still exposes a resolved tmux directory to the agent", () =>
   });
   assert.equal(env.PATH, "/usr/bin:/usr/local/bin");
   assert.equal(env.TMUX, "");
+});
+
+// ── namespace prefixes (sandboxed / containerised providers) ────────────────
+
+const SBX_PREFIX = ["sbx", "exec", "-i", "-w", "{cwd}", "pi-recovery-test", "--"];
+
+test("prefix placeholders are substituted in every element", () => {
+  const values = { cwd: "/home/cosmin/work", agentId: "a1b2" };
+  assert.deepEqual(applyExecPlaceholders(SBX_PREFIX, values), [
+    "sbx",
+    "exec",
+    "-i",
+    "-w",
+    "/home/cosmin/work",
+    "pi-recovery-test",
+    "--",
+  ]);
+  assert.deepEqual(applyExecPlaceholders(["echo", "{agentId}", "{agentId}/{cwd}"], values), [
+    "echo",
+    "a1b2",
+    "a1b2//home/cosmin/work",
+  ]);
+  assert.deepEqual(applyExecPlaceholders([], values), []);
+});
+
+test("provider prefix wins, an explicit empty entry means the host, else the global prefix", () => {
+  const map = { "pi-recovery": SBX_PREFIX, pi: [] };
+  assert.deepEqual(resolveExecPrefix({ provider: "pi-recovery", providerTmuxExec: map, tmuxExec: ["ssh", "box"] }), SBX_PREFIX);
+  assert.deepEqual(resolveExecPrefix({ provider: "pi", providerTmuxExec: map, tmuxExec: ["ssh", "box"] }), []);
+  assert.deepEqual(resolveExecPrefix({ provider: "pi-other", providerTmuxExec: map, tmuxExec: ["ssh", "box"] }), [
+    "ssh",
+    "box",
+  ]);
+  assert.deepEqual(resolveExecPrefix({ provider: "pi-other", providerTmuxExec: map }), []);
+  assert.deepEqual(resolveExecPrefix({ provider: "pi" }), []);
+});
+
+test("an empty prefix keeps the host invocation byte-compatible", () => {
+  assert.deepEqual(tmuxInvocation("/usr/bin/tmux", [], ["new-session", "-d"]), {
+    command: "/usr/bin/tmux",
+    args: ["new-session", "-d"],
+  });
+});
+
+test("a prefix wraps tmux: the wrapper runs, tmux follows its own argv", () => {
+  const values = { cwd: "/srv/app", agentId: "ag1" };
+  const prefix = applyExecPlaceholders(SBX_PREFIX, values);
+  assert.deepEqual(tmuxInvocation("/usr/bin/tmux", prefix, ["ls", "-t", "paseo-ag1"]), {
+    command: "sbx",
+    args: ["exec", "-i", "-w", "/srv/app", "pi-recovery-test", "--", "/usr/bin/tmux", "ls", "-t", "paseo-ag1"],
+  });
+  assert.deepEqual(attachInvocation("/usr/bin/tmux", prefix, "paseo-ag1").args, [
+    "exec",
+    "-i",
+    "-w",
+    "/srv/app",
+    "pi-recovery-test",
+    "--",
+    "/usr/bin/tmux",
+    "attach",
+    "-t",
+    "paseo-ag1",
+  ]);
+});
+
+test("probes run inside the namespace too", () => {
+  const prefix = applyExecPlaceholders(SBX_PREFIX, { cwd: "/srv/app", agentId: "ag1" });
+  assert.deepEqual(shellProbeInvocation(prefix, "/bin/sh", ["-lc", "command -v tmux"]), {
+    command: "sbx",
+    args: ["exec", "-i", "-w", "/srv/app", "pi-recovery-test", "--", "/bin/sh", "-lc", "command -v tmux"],
+  });
+  assert.deepEqual(shellProbeInvocation([], "/usr/bin/tmux", ["-V"]), {
+    command: "/usr/bin/tmux",
+    args: ["-V"],
+  });
+});
+
+test("the namespace label is short and stable", () => {
+  assert.equal(execLabel(SBX_PREFIX), "sbx:pi-recovery-test");
+  assert.equal(execLabel([]), "host");
+  assert.equal(execLabel(["/usr/local/bin/nsenter", "--mount=/x.mntns", "--"]), "nsenter");
+  assert.equal(execLabel(["ssh", "box"]), "ssh:box");
+});
+
+test("PATH is only rewritten when tmux is not reachable inside the namespace", () => {
+  // Their container ships tmux on its own PATH: rewriting would inject a host
+  // directory that does not exist there.
+  assert.equal(tmuxDirToInject({ path: "/usr/bin/tmux", reachableInPath: true }), null);
+  assert.equal(tmuxDirToInject({ path: "/usr/bin/tmux", reachableInPath: false }), "/usr/bin");
+  assert.equal(tmuxDirToInject({ path: null, reachableInPath: false }), null);
+
+  const env = buildInjectedEnv({ PATH: "/usr/local/bin:/bin" }, {
+    socketPath: "/tmp/tmux-1000/default",
+    pid: 4242,
+    paneId: "%9",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 0,
+    tmuxPath: "/usr/bin/tmux",
+    injectTmuxDir: false,
+  });
+  assert.equal(env.PATH, "/usr/local/bin:/bin", "container already has tmux: leave PATH alone");
+  assert.equal(env.TMUX, "/tmp/tmux-1000/default,4242,0");
+});
+
+test("the TMUX pid is the server pid inside the namespace, not the daemon's", async () => {
+  assert.deepEqual(displayServerPidCmd(), ["display-message", "-p", "#{pid}"]);
+  assert.equal(parseServerPid("24601\n"), 24601);
+  assert.equal(parseServerPid("not-a-pid"), null);
+  assert.equal(parseServerPid(""), null);
+
+  const seen: string[][] = [];
+  const client = new TmuxClient(async (args) => {
+    seen.push(args);
+    if (args[0] === "has-session") return { ok: true, stdout: "", stderr: "" };
+    if (args[0] === "display-message" && args[args.length - 1] === "#{pane_id}") {
+      return { ok: true, stdout: "%7\n", stderr: "" };
+    }
+    if (args[0] === "display-message" && args[args.length - 1] === "#{socket_path}") {
+      return { ok: true, stdout: "/tmp/tmux-1000/default\n", stderr: "" };
+    }
+    if (args[0] === "display-message" && args[args.length - 1] === "#{pid}") {
+      return { ok: true, stdout: "24601\n", stderr: "" };
+    }
+    return { ok: true, stdout: "", stderr: "" };
+  });
+  const result = await client.ensureSession({
+    name: "paseo-a",
+    cwd: "/srv/app",
+    cols: 220,
+    rows: 60,
+    placeholder: "$SHELL -l",
+    layout: AMOS_LAYOUT,
+  });
+  assert.ok(result.ok);
+  assert.equal(result.handle.socketPath, "/tmp/tmux-1000/default");
+  assert.equal(result.handle.serverPid, 24601, "the pid inside the namespace, not the daemon's");
+  assert.ok(
+    seen.some((args) => args[0] === "display-message" && args[args.length - 1] === "#{pid}"),
+    "the server pid must be asked for inside the namespace",
+  );
+});
+
+test("bookkeeping pins the namespace the session was created in", () => {
+  const map = new BridgeBookkeeping();
+  map.rememberOpened({
+    agentId: "a7",
+    sessionName: "paseo-a7",
+    workspaceId: "w1",
+    cwd: "/srv/app",
+    provider: "pi-recovery",
+    tmuxPath: "/usr/bin/tmux",
+    tmuxPrefix: [...SBX_PREFIX],
+    tmuxLabel: "sbx:pi-recovery-test",
+  });
+  const record = map.get("a7");
+  assert.equal(record?.provider, "pi-recovery");
+  assert.equal(record?.tmuxPath, "/usr/bin/tmux");
+  assert.deepEqual(record?.tmuxPrefix, SBX_PREFIX);
+  assert.equal(record?.tmuxLabel, "sbx:pi-recovery-test");
+  // A later resume without namespace info must not lose what was recorded.
+  map.rememberOpened({ agentId: "a7", sessionName: "paseo-a7", workspaceId: "w1", cwd: "/srv/app" });
+  assert.equal(map.get("a7")?.tmuxLabel, "sbx:pi-recovery-test");
+});
+
+test("the resolution probe and the agent-PATH probe are different on purpose", () => {
+  // The login shell may find tmux where the agent PATH cannot; if the same argv
+  // were used for both, no PATH would be injected and Amos would fail.
+  assert.deepEqual(TMUX_WHICH_ARGS, ["-lc", "command -v tmux"]);
+  assert.deepEqual(TMUX_REACHABLE_ARGS, ["-c", "command -v tmux"]);
+  assert.notDeepEqual(TMUX_REACHABLE_ARGS, TMUX_WHICH_ARGS);
+  assert.equal(tmuxDirToInject({ path: "/usr/bin/tmux", reachableInPath: undefined }), null);
 });

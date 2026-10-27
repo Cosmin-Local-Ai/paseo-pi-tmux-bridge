@@ -27,8 +27,9 @@ On `agent.session_open` for an interactive **Pi** session:
   `piProviders` lets you list exact ids. `pilot` and `openapi` do not match.
 
 1. Creates (or reuses) a private tmux session named `<sessionPrefix><agentId>` — default prefix
-   `paseo-` — with a long-lived placeholder pane (`$SHELL -l`, falling back to `tail -f /dev/null`).
-   A dead host pane would kill Amos's split target, so it must stay alive.
+   `paseo-` — **in the namespace the agent runs in** (the daemon host, or wherever `tmuxExec` /
+   `providerTmuxExec` points), with a long-lived placeholder pane (`$SHELL -l`, falling back to
+   `tail -f /dev/null`). A dead host pane would kill Amos's split target, so it must stay alive.
 2. Applies the layout (default `even-horizontal`, matching Amos's own constant) and reads that
    session's `pane_id` plus the tmux `socket_path`.
 3. Injects into the launch env — always spreading the existing env, because Paseo does **not**
@@ -36,12 +37,13 @@ On `agent.session_open` for an interactive **Pi** session:
 
    | variable | value |
    | --- | --- |
-   | `TMUX` | `<socket_path>,<daemon pid>,0` |
+   | `TMUX` | `<socket_path>,<tmux server pid inside the namespace>,0` |
    | `TMUX_PANE` | the placeholder pane id |
    | `PASEO_TMUX_SESSION` | the session name |
    | `PI_SUBAGENT_SHELL_READY_DELAY_MS` | `2000` (Amos's own default is `500`) |
 
-4. Opens a Paseo terminal in the agent's workspace running `tmux attach -t <session>`, so the
+4. Opens a Paseo terminal in the agent's workspace running `<prefix> tmux attach -t <session>` (the
+   same prefix as every other tmux call), so the
    subagent panes appear side by side. Creation is fire-and-forget; it never blocks or fails launch.
    Amos identity variables (`PI_SUBAGENT_*`) inherited from the daemon are stripped from the launch
    env by default (`stripAmosIdentity`), otherwise Amos treats the agent as an existing subagent and
@@ -105,7 +107,9 @@ Then just ask the agent to use the `subagent` tool as you would inside tmux.
 | `sessionPrefix` | `paseo-` | session = prefix + agent id |
 | `layout` | `even-horizontal` | `tmux select-layout` name |
 | `placeholderCmd` | `$SHELL -l` | keeps the host pane alive; `$SHELL` is substituted |
-| `tmuxPath` | `""` | absolute tmux override; empty = resolve it yourself (see below) |
+| `tmuxPath` | `""` | absolute tmux override **inside the target namespace**; empty = resolve it (see below) |
+| `tmuxExec` | `[]` | argv placed before tmux for every call — run tmux in another namespace (`["sbx","exec",…,"--"]`); `{cwd}`/`{agentId}` are substituted |
+| `providerTmuxExec` | `{}` | per-provider prefix, keyed by the provider id Paseo reports; wins over `tmuxExec`, an explicit `[]` pins that provider to the host |
 | `shellReadyDelayMs` | `2000` | written to `PI_SUBAGENT_SHELL_READY_DELAY_MS` |
 | `autoAttachTerminal` | `true` | open the attach terminal automatically |
 | `killOnClose` | `true` | kill the session on close/archive |
@@ -133,8 +137,9 @@ process, so without that the agent cannot split panes even when the plugin can.
 
 If nothing resolves, the failure is loud rather than silent:
 
-- the panel header reads **`tmux not found on daemon host — install tmux or set tmuxPath`**, the
-  attach button becomes `tmux unavailable`, and the panel lists every probed location;
+- the panel header reads **`tmux not found on daemon host — install tmux there or set tmuxPath / tmuxExec`**
+  (or `tmux not found in sbx:pi-recovery-test` for a namespaced provider), the attach button becomes
+  `tmux unavailable`, and the panel lists every probed location and the namespace used;
 - `paseo plugin logs pi-tmux-bridge` prints the same sentence plus the full tried list;
 - the agent still starts, with `TMUX` empty, so Amos reports its own *"Subagents require tmux"*
   message instead of splitting from a stale pane.
@@ -147,7 +152,45 @@ paseo daemon config          # or the "Pi tmux bridge" settings screen
 ```
 
 then `paseo plugin reload pi-tmux-bridge` (or start a new agent). The panel header shows the
-resolved path next to the pane count once it works, e.g. `2 panes · /usr/bin/tmux`.
+namespace and resolved path next to the pane count once it works, e.g.
+`2 panes · host · /usr/bin/tmux`.
+
+## Sandboxed providers: tmux must run where the agent runs
+
+A provider whose command wraps `pi` in a container (`sbx exec … -- pi`, `nsenter`, `ssh box`, a VM
+launcher) does not share the daemon's filesystem view. For those, creating the session on the daemon
+host and injecting the host socket is not merely useless — it is fatal: the agent gets
+`TMUX=/tmp/tmux-1000/default,…`, no such socket exists inside the container, and Amos cannot connect
+even though the image ships tmux. Give the plugin the argv that enters the agent's namespace:
+
+```jsonc
+// providerTmuxExec — keyed by the provider id Paseo reports
+{ "pi-recovery": ["sbx", "exec", "-i", "-w", "{cwd}", "pi-recovery-test", "--"] }
+
+// tmuxExec — one global prefix, used when no provider entry matches
+["nsenter", "--mount=/run/paseo-agent.mntns", "--"]
+```
+
+- `{cwd}` and `{agentId}` are substituted in every element (`{cwd}` is the agent workspace).
+- A provider entry wins over `tmuxExec`; an explicit `[]` pins that provider to the daemon host.
+  Both empty (the default) is byte-identical to the old host behaviour.
+- **Every** tmux operation goes through the prefix: the `-V` probe, `command -v tmux`,
+  `new-session`, `display-message` (`#{pane_id}`, `#{socket_path}`, `#{pid}`), `list-panes`,
+  `capture-pane`, `select-pane`, `select-layout`, `kill-pane`, `kill-session`, and the attach
+  terminal's own `command`.
+- `tmuxPath` is the path **inside** that namespace and stays authoritative — a bad override fails
+  visibly instead of falling back to a different tmux.
+- The injected env is what is valid inside: `TMUX` is built from `#{socket_path}` and `#{pid}` read
+  **inside**, so neither the socket nor the server pid belongs to the daemon.
+- `PATH` is only rewritten when `command -v tmux` fails inside (plain shell, no login profile). A
+  namespace that already has tmux on its `PATH` keeps its `PATH` untouched.
+- Cleanup is namespace-pinned: the record stores the prefix the session was created in, so a kill
+  still runs there after a settings change; after a `plugin reload` the configured prefixes are
+  re-probed and the first namespace that actually holds the session wins.
+
+`tests/namespaced-sandbox-harness.sh` builds a faithful stand-in (a `sudo unshare -m` holder whose
+`/tmp/tmux-$UID` is a private tmpfs, entered with `nsenter --mount=<nsfile> --`) for testing all of
+this without a real container runtime.
 
 ## Layout
 
@@ -198,13 +241,24 @@ name is never accepted from the client.
 5. **A dead host pane breaks everything.** The placeholder pane is what `TMUX_PANE` points at, so it
    must stay alive for the whole agent lifetime — hence `$SHELL -l` with a `tail -f /dev/null`
    fallback rather than a short-lived command.
+6. **A namespace with a private `/tmp` breaks the provider before the plugin can help.** Paseo passes
+   the Pi integration extension as a host temp path (`--extension /tmp/paseo-pi-extension-XXXX/…`);
+   if that path does not exist inside the namespace, `pi` exits with `Extension path does not exist`.
+   Make Paseo's temp dir visible there (the harness isolates only `/tmp/tmux-$UID` for this reason).
+7. **tmux refuses a socket directory it does not own** — `directory /tmp/tmux-1000 has unsafe
+   permissions`. When you build the namespace yourself, own it to the agent uid:
+   `mount -t tmpfs -o uid=1000,gid=1000,mode=700 tmpfs /tmp/tmux-1000`.
+8. **`command -v tmux` has to be asked twice, differently.** The login shell (`-lc`) is what finds
+   tmux for a desktop daemon whose `PATH` lacks it; whether the *agent* can reach tmux must be asked
+   with a plain shell (`-c`). Reusing the login answer skips the `PATH` rewrite and Amos never splits
+   a pane — a regression a live run caught and a static check did not.
 
 ## Tests
 
 ```bash
 export CHECKOUT=$HOME/src/paseo                 # any Paseo checkout >= 0.13.0
 
-node --test tests/unit.test.ts                  # 28 unit tests, no daemon needed
+node --test tests/unit.test.ts                  # 52 unit tests, no daemon needed
 
 # typecheck against the Paseo SDK (tsconfig.json is local-only; generate it once)
 sed "s|<paseo-checkout>|$CHECKOUT|g" tsconfig.example.json > tsconfig.json
@@ -219,12 +273,16 @@ bash tests/concurrent-agents-check.sh           # two agents at once -> disjoint
 ## Verification status
 
 Proven, including in a real rendered Paseo app (screenshots in `evidence/`, details in
-`VERIFICATION.md`): 28/28 unit tests, Paseo's own `compilePlugin()`, a daemon loading the plugin
+`VERIFICATION.md`): 52/52 unit tests, Paseo's own `compilePlugin()`, a daemon loading the plugin
 (`STATUS = running`), a `pi` agent **and** a `pi-recovery` (custom provider) agent each getting their
 own session and injected env, the attach terminal appearing as a tab in the UI, the panel rendering
 side by side with the chat in the explorer pane, both panes listed with real captured content, and
-**two agents at once getting disjoint panes**. Not proven: `agent.closed` (as opposed to
-`agent.archived`) firing, `resume`/`import` in a live daemon, and submitting `/tmux` by hand (the
-command-center path to the same panel is proven).
+**two agents at once getting disjoint panes**. Also proven against a genuine mount namespace (the
+sandbox harness): the session lives only inside it, the host never sees it, the agent's `TMUX` points
+at the namespace's socket and server pid, the panel/attach terminal/capture/focus/kill all work
+through the prefix, cleanup re-probes the prefix after a `plugin reload`, and the non-namespaced host
+path still resolves tmux absolutely and injects `PATH` when tmux is not on it. Not proven: `agent.closed`
+(as opposed to `agent.archived`) firing, `resume`/`import` in a live daemon, and submitting `/tmux` by
+hand (the command-center path to the same panel is proven).
 
 See `VERIFICATION.md` for exactly what was run and what the output was.

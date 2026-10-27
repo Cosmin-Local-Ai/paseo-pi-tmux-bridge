@@ -9,6 +9,10 @@ import { z } from "zod";
  * agent id to form a tmux session name that is later passed as a `-t` argv
  * element, so a leading `-` or shell/regex metacharacter must be impossible.
  */
+/** One argv element of a namespace prefix; `{cwd}` / `{agentId}` are substituted. */
+const execArgSchema = z.string().min(1).max(300);
+const providerIdSchema = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
+
 export const bridgeSettings = defineSettings({
   id: "pi-tmux-bridge",
   scope: "host",
@@ -25,16 +29,29 @@ export const bridgeSettings = defineSettings({
       .default("even-horizontal"),
     placeholderCmd: z.string().trim().min(1).max(200).default("$SHELL -l"),
     /**
-     * Absolute path to the tmux binary on the daemon host. Empty means "find it
-     * yourself": `command -v tmux` first, then a fixed candidate list. Set this
-     * when tmux lives somewhere the daemon cannot see — a desktop daemon often
-     * starts with a PATH that contains no tmux directory at all.
+     * Absolute path to the tmux binary **inside the target namespace** (the
+     * daemon host when `tmuxExec` / `providerTmuxExec` are empty, the container
+     * otherwise). Empty means "find it yourself": `command -v tmux` inside the
+     * namespace first, then a fixed candidate list. Authoritative when set.
      */
     tmuxPath: z
       .string()
       .trim()
       .regex(/^(?:|\/.{0,299})$/, "Use an absolute path such as /usr/bin/tmux")
       .default(""),
+    /**
+     * argv placed **before** the tmux binary for every tmux operation, so tmux
+     * runs where the agent runs: `["sbx","exec","-i","-w","{cwd}","ctr","--"]`,
+     * `["ssh","host"]`, `["nsenter","--mount=/run/x.mntns","--"]`. Empty (the
+     * default) means run tmux on the daemon host, exactly as before.
+     */
+    tmuxExec: z.array(execArgSchema).max(16).default([]),
+    /**
+     * Per-provider prefix, keyed by the provider id Paseo reports (`pi`,
+     * `pi-recovery`, …). Wins over `tmuxExec`; an explicit empty array means
+     * "this provider uses the host".
+     */
+    providerTmuxExec: z.record(providerIdSchema, z.array(execArgSchema).max(16)).default({}),
     shellReadyDelayMs: z.number().int().min(0).max(60000).default(2000),
     autoAttachTerminal: z.boolean().default(true),
     /**
@@ -108,6 +125,8 @@ export const sessionStatusRpc = defineRpc({
     tmuxAvailable: z.boolean(),
     /** Absolute path the plugin resolved; empty when nothing resolved. */
     tmuxPath: z.string(),
+    /** Which namespace the tmux calls run in (`host`, `sbx:pi-recovery-test`). */
+    tmuxExecLabel: z.string(),
     /** Every location probed, so a failure names what was tried. */
     tmuxTried: z.array(z.string()),
     detail: z.string().optional(),
@@ -124,6 +143,7 @@ export const listPanesRpc = defineRpc({
     panes: z.array(paneDtoSchema),
     tmuxAvailable: z.boolean(),
     tmuxPath: z.string(),
+    tmuxExecLabel: z.string(),
     tmuxTried: z.array(z.string()),
     detail: z.string().optional(),
   }),
