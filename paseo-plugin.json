@@ -1,0 +1,8 @@
+{
+  "id": "pi-tmux-bridge",
+  "name": "Pi tmux bridge",
+  "description": "Give every Pi agent its own tmux session, so tmux-based Pi extensions such as amosblomqvist/pi-interactive-subagents spawn their subagent panes side by side inside Paseo.",
+  "requirements": {
+    "paseo": ">=0.13.0"
+  }
+}

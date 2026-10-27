@@ -1,0 +1,52 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "noEmit": true,
+    "types": ["node"],
+    "typeRoots": ["<paseo-checkout>/node_modules/@types"],
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "baseUrl": ".",
+    "paths": {
+      "@getpaseo/plugin": ["<paseo-checkout>/packages/plugin/src/index.ts"],
+      "@getpaseo/plugin/server": [
+        "<paseo-checkout>/packages/plugin/src/server/index.ts"
+      ],
+      "@getpaseo/plugin/client": [
+        "<paseo-checkout>/packages/plugin/src/client/index.ts"
+      ],
+      "@getpaseo/plugin/client/ui": [
+        "<paseo-checkout>/packages/plugin/src/client/ui.ts"
+      ],
+      "@getpaseo/client": ["<paseo-checkout>/packages/client/src/index.ts"],
+      "@getpaseo/protocol/*": ["<paseo-checkout>/packages/protocol/src/*"],
+      "zod": ["<paseo-checkout>/node_modules/zod/index.d.ts"],
+      "react": ["<paseo-checkout>/node_modules/@types/react/index.d.ts"],
+      "react/jsx-runtime": [
+        "<paseo-checkout>/node_modules/@types/react/jsx-runtime.d.ts"
+      ],
+      "react-native": [
+        "<paseo-checkout>/node_modules/react-native/types/index.d.ts"
+      ],
+      "use-sync-external-store/shim/with-selector": [
+        "<paseo-checkout>/packages/plugin/src/client/use-sync-external-store.d.ts"
+      ]
+    }
+  },
+  "include": [
+    "index.server.ts",
+    "index.client.tsx",
+    "shared/**/*.ts",
+    "server/**/*.ts",
+    "client/**/*.tsx",
+    "tests/**/*.ts"
+  ]
+}
