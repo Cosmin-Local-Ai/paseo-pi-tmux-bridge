@@ -84,12 +84,69 @@ function isOwnSessionNameShape(name: string, prefix: string): boolean {
   return isSafeAgentId(rest);
 }
 
+/** Provider id of the built-in Pi provider. */
+export const PI_PROVIDER_ID = "pi";
+
+/**
+ * Paseo lets a user declare a custom agent provider with `extends: "pi"`, for
+ * example `pi-recovery`. `agent.session_open` reports the *derived* provider id
+ * (`packages/server/src/server/agent/agent-manager.ts` sends `client.provider`),
+ * never `pi`, so an exact `provider === "pi"` match silently disables the bridge
+ * for every agent of such a provider. A `pi` token in the id recognises them.
+ * The token is delimited, so `pilot` and `openapi` do not match.
+ */
+const PI_PROVIDER_TOKEN = /(?:^|[-_.])pi(?:[-_.]|$)/;
+
+export interface PiProviderMatchOptions {
+  /** Exact provider ids to treat as Pi regardless of the heuristic. */
+  extraProviderIds?: readonly string[];
+  /** Default true: recognise `pi`-derived provider ids such as `pi-recovery`. */
+  autoDetect?: boolean;
+}
+
+export function isPiProviderId(
+  provider: string,
+  options: PiProviderMatchOptions = {},
+): boolean {
+  if (typeof provider !== "string" || provider.length === 0) return false;
+  if (provider === PI_PROVIDER_ID) return true;
+  if ((options.extraProviderIds ?? []).includes(provider)) return true;
+  return (options.autoDetect ?? true) && PI_PROVIDER_TOKEN.test(provider);
+}
+
 /** Only interactive Pi sessions get a tmux bridge. */
-export function shouldHandleSessionOpen(request: {
-  provider: string;
-  purpose: string;
-}): boolean {
-  return request.provider === "pi" && request.purpose === "interactive";
+export function shouldHandleSessionOpen(
+  request: { provider: string; purpose: string },
+  options: PiProviderMatchOptions = {},
+): boolean {
+  return request.purpose === "interactive" && isPiProviderId(request.provider, options);
+}
+
+/**
+ * Amos identity variables. A Paseo agent is always a top-level Pi session, but
+ * Paseo passes the daemon's environment down, so a daemon started from inside
+ * an Amos subagent pane hands its identity to every agent. Amos's self-spawn
+ * guard then refuses `subagent({ agent: "worker" })` with "You are the worker
+ * agent", which looks exactly like the bridge doing nothing.
+ */
+export const AMOS_IDENTITY_ENV_KEYS: readonly string[] = [
+  "PI_SUBAGENT_AGENT",
+  "PI_SUBAGENT_NAME",
+  "PI_SUBAGENT_ID",
+  "PI_SUBAGENT_ALLOWED",
+  "PI_SUBAGENT_AUTO_EXIT",
+  "PI_SUBAGENT_SURFACE",
+  "PI_SUBAGENT_SESSION",
+  "PI_SUBAGENT_ACTIVITY_FILE",
+];
+
+export function stripAmosIdentity(env: Record<string, string>): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (AMOS_IDENTITY_ENV_KEYS.includes(key)) continue;
+    next[key] = value;
+  }
+  return next;
 }
 
 /**
@@ -233,6 +290,8 @@ export interface InjectedEnvOptions {
   paneId: string;
   sessionName: string;
   shellReadyDelayMs: number;
+  /** Default true: never let the daemon's Amos identity reach a top-level agent. */
+  stripAmosIdentity?: boolean;
 }
 
 /**
@@ -244,7 +303,7 @@ export function buildInjectedEnv(
   options: InjectedEnvOptions,
 ): Record<string, string> {
   return {
-    ...base,
+    ...(options.stripAmosIdentity === false ? base : stripAmosIdentity(base)),
     TMUX: `${options.socketPath},${options.pid},0`,
     TMUX_PANE: options.paneId,
     [SESSION_ENV_KEY]: options.sessionName,
@@ -260,10 +319,10 @@ export function buildInjectedEnv(
  */
 export function buildTmuxUnavailableEnv(
   base: Record<string, string>,
-  options: { shellReadyDelayMs: number },
+  options: { shellReadyDelayMs: number; stripAmosIdentity?: boolean },
 ): Record<string, string> {
   return {
-    ...base,
+    ...(options.stripAmosIdentity === false ? base : stripAmosIdentity(base)),
     TMUX: "",
     TMUX_PANE: "",
     [SESSION_ENV_KEY]: "",

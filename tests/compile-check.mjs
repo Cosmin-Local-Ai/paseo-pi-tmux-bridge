@@ -10,7 +10,7 @@
  *
  *   CHECKOUT=$HOME/src/paseo npx --prefix "$CHECKOUT" tsx tests/compile-check.mjs
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -33,7 +33,22 @@ const result = await compilePlugin({
   client: `${DIR}/index.client.tsx`,
 });
 
+// The host validates every client contribution id against this exact pattern
+// (packages/app/src/plugins/evaluate.ts, CONTRIBUTION_ID). One bad id throws
+// inside contribute() and the host then discards the entire client bundle, so
+// the plugin looks completely absent in the UI.
+const CONTRIBUTION_ID = /^[a-z][a-z0-9-]*$/;
+const clientSource = readFileSync(path.join(DIR, "index.client.tsx"), "utf8");
+const contributionIds = [
+  // Inline ids, and the string constants the entry file passes as ids.
+  ...clientSource.matchAll(/\b(?:id|name):\s*"([^"]+)"/g),
+  ...clientSource.matchAll(/\bconst\s+[A-Z][A-Z0-9_]*(?:_ID|_PANEL_ID|_SETTINGS_ID)\s*=\s*"([^"]+)"/g),
+].map((match) => match[1]);
+const badContributionIds = contributionIds.filter((id) => !CONTRIBUTION_ID.test(id));
+
 const report = {
+  contributionIdsChecked: contributionIds.length,
+  badContributionIds,
   serverBundleBytes: result.serverBundle?.length ?? 0,
   clientBundleBytes: result.clientBundle?.length ?? 0,
   serverHasContribute: /function contribute|contribute as default|exports\.default/.test(
@@ -59,7 +74,9 @@ const ok =
   report.serverRegistersSessionOpen &&
   report.clientHasAgentPanel &&
   report.serverHasRpcNames.length === 6 &&
-  report.clientHasRpcNames.length === 6;
+  report.clientHasRpcNames.length === 6 &&
+  report.contributionIdsChecked >= 6 &&
+  report.badContributionIds.length === 0;
 
 console.log(`compile-check: ${ok ? "PASS" : "FAIL"}`);
 process.exit(ok ? 0 : 1);

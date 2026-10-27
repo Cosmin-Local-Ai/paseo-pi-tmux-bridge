@@ -74,6 +74,9 @@ function describeError(error: unknown): string {
 
 export default function contribute(server: PluginServerContext): () => void {
   const bookkeeping = new BridgeBookkeeping();
+  // Providers whose interactive sessions were skipped, so the skip is logged
+  // once instead of on every session_open.
+  const skippedProviders = new Set<string>();
   const settingsHandle = server.registerSettings(bridgeSettings);
 
   // `schema.parse({})` yields the declared defaults, so there is one source of
@@ -204,7 +207,24 @@ export default function contribute(server: PluginServerContext): () => void {
     try {
       const settings = await currentSettings();
       if (!settings.enabled) return;
-      if (!shouldHandleSessionOpen(request)) return;
+      const guardOptions = {
+        extraProviderIds: settings.piProviders,
+        autoDetect: settings.autoDetectPiProviders,
+      };
+      if (!shouldHandleSessionOpen(request, guardOptions)) {
+        if (
+          request.purpose === "interactive" &&
+          !skippedProviders.has(request.provider) &&
+          settings.piProviders.length === 0
+        ) {
+          skippedProviders.add(request.provider);
+          log(
+            `skipping provider ${JSON.stringify(request.provider)}: it is not a Pi provider. ` +
+              `Add it to the piProviders setting if it launches pi.`,
+          );
+        }
+        return;
+      }
 
       const sessionName = sessionNameFor(settings.sessionPrefix, request.agentId);
       if (!sessionName) {
@@ -244,7 +264,9 @@ export default function contribute(server: PluginServerContext): () => void {
           `pane ${ensured.handle.paneId}${ensured.handle.created ? " (created)" : " (reused)"}`,
       );
 
-      scheduleAttachTerminal(context.paseo, request, sessionName);
+      if (settings.autoAttachTerminal) {
+        scheduleAttachTerminal(context.paseo, request, sessionName);
+      }
 
       return {
         ...request,
@@ -254,6 +276,7 @@ export default function contribute(server: PluginServerContext): () => void {
           paneId: ensured.handle.paneId,
           sessionName,
           shellReadyDelayMs: settings.shellReadyDelayMs,
+          stripAmosIdentity: settings.stripAmosIdentity,
         }),
       };
     } catch (error) {
@@ -273,32 +296,55 @@ export default function contribute(server: PluginServerContext): () => void {
     try {
       const settings = await currentSettings();
       const record = bookkeeping.get(agentId);
-      if (!record) return;
 
-      if (record.terminalId) {
+      // The bookkeeping map is per plugin instance, so after `plugin reload` or a
+      // daemon restart it is empty while the tmux session and terminal are still
+      // alive. Both are named deterministically from the agent id, so cleanup can
+      // still recover instead of leaking a session forever.
+      const derivedSession = sessionNameFor(settings.sessionPrefix, agentId);
+      const sessionName = record?.sessionName ?? derivedSession ?? "";
+
+      let terminalId = record?.terminalId ?? null;
+      if (!terminalId) {
         try {
-          await paseo.terminals.ref(record.terminalId).kill();
-          log(`killed attach terminal ${record.terminalId} for agent ${agentId}`);
+          const listed = await paseo.terminals.list();
+          const name = attachTerminalName(agentId);
+          terminalId = listed.entries.find((entry) => entry.name === name)?.id ?? null;
+        } catch (error) {
+          log(`terminal list failed for ${agentId}: ${describeError(error)}`);
+        }
+      }
+
+      if (terminalId) {
+        try {
+          await paseo.terminals.ref(terminalId).kill();
+          log(`killed attach terminal ${terminalId} for agent ${agentId}`);
         } catch (error) {
           log(`attach terminal kill failed for ${agentId}: ${describeError(error)}`);
         }
       }
 
-      if (!settings.killOnClose) {
+      if (!settings.killOnClose || !sessionName) {
         bookkeeping.forget(agentId);
         return;
       }
 
       // Guard: only a name this plugin derived from this agent id may be killed.
-      if (!isOwnSessionName(record.sessionName, settings.sessionPrefix, agentId)) {
-        log(`refusing to kill non-bridge session ${record.sessionName}`);
+      if (!isOwnSessionName(sessionName, settings.sessionPrefix, agentId)) {
+        log(`refusing to kill non-bridge session ${sessionName}`);
         bookkeeping.forget(agentId);
         return;
       }
 
-      const result = await tmuxFor().killSession(record.sessionName);
-      if (result.ok) log(`killed tmux session ${record.sessionName} (${reason})`);
-      else log(`tmux kill-session ${record.sessionName} failed: ${result.stderr}`);
+      const tmux = tmuxFor();
+      if (!(await tmux.sessionExists(sessionName))) {
+        bookkeeping.forget(agentId);
+        return;
+      }
+
+      const result = await tmux.killSession(sessionName);
+      if (result.ok) log(`killed tmux session ${sessionName} (${reason})`);
+      else log(`tmux kill-session ${sessionName} failed: ${result.stderr}`);
 
       bookkeeping.forget(agentId);
     } catch (error) {
@@ -321,7 +367,7 @@ export default function contribute(server: PluginServerContext): () => void {
   }
 
   server.handle(sessionStatusRpc, async (input) => {
-    const { settings, name } = await sessionFor(input.agentId);
+    const { name } = await sessionFor(input.agentId);
     if (!name) {
       return {
         agentId: input.agentId,

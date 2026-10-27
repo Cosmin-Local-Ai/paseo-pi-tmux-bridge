@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
+  usePaseo,
   useRpc,
   useSettings,
   type PluginAgentPanelProps,
+  type PluginWorkspacePanelProps,
 } from "@getpaseo/plugin/client";
-import { Icon, Modal, SidebarRow, useToast } from "@getpaseo/plugin/client/ui";
+import { Icon, Modal, useToast } from "@getpaseo/plugin/client/ui";
 import {
   bridgeSettings,
   capturePaneRpc,
@@ -34,7 +36,18 @@ const FALLBACK_CAPTURE_LINES = 15;
  * plain message rather than an error.
  */
 export function TmuxPanel({ theme, layout, params }: PluginAgentPanelProps) {
-  const agentId = params.agentId;
+  return <TmuxPanelBody theme={theme} layout={layout} agentId={params.agentId} />;
+}
+
+function TmuxPanelBody({
+  theme,
+  layout,
+  agentId,
+}: {
+  theme: PluginAgentPanelProps["theme"];
+  layout: PluginAgentPanelProps["layout"];
+  agentId: string;
+}) {
   const callListPanes = useRpc(listPanesRpc);
   const callCapturePane = useRpc(capturePaneRpc);
   const callSelectPane = useRpc(selectPaneRpc);
@@ -169,6 +182,24 @@ export function TmuxPanel({ theme, layout, params }: PluginAgentPanelProps) {
         fontFamily: "monospace",
       },
       row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
+      // Panes sit side by side, left to right in tmux index order, so a
+      // subagent that tmux splits to the right also appears on the right here.
+      panesRow: {
+        flexDirection: "row" as const,
+        flexWrap: "wrap" as const,
+        gap: 12,
+        alignItems: "stretch" as const,
+      },
+      paneCard: {
+        flex: 1,
+        minWidth: 280,
+        backgroundColor: theme.colors.surface1,
+        borderColor: theme.colors.border,
+        borderWidth: 1,
+        borderRadius: 10,
+        padding: 12,
+        gap: 6,
+      },
       button: {
         paddingHorizontal: 10,
         paddingVertical: 6,
@@ -226,15 +257,23 @@ export function TmuxPanel({ theme, layout, params }: PluginAgentPanelProps) {
         ) : null}
       </View>
 
+      <View style={styles.panesRow}>
       {panes.map((pane) => (
-        <View key={pane.paneId} style={styles.card}>
-          <SidebarRow
-            id={pane.paneId}
-            icon={pane.active ? "CircleDot" : "Circle"}
-            label={`${pane.paneId} · ${pane.paneCurrentCommand || "?"} · ${pane.paneWidth}x${pane.paneHeight}`}
-            active={pane.active}
+        <View key={pane.paneId} style={styles.paneCard}>
+          <Pressable
+            accessibilityRole="button"
             onPress={() => void handleInspect(pane.paneId)}
-          />
+            style={styles.row}
+          >
+            <Icon
+              name={pane.active ? "CircleDot" : "Circle"}
+              size={14}
+              color={pane.active ? theme.colors.accent : theme.colors.foregroundMuted}
+            />
+            <Text style={styles.paneTitle}>
+              {`${pane.paneId} · ${pane.paneCurrentCommand || "?"} · ${pane.paneWidth}x${pane.paneHeight}`}
+            </Text>
+          </Pressable>
           <Text style={styles.paneTitle}>
             {`index ${pane.paneIndex} · pid ${pane.panePid} · title ${pane.paneTitle || "(none)"}`}
           </Text>
@@ -261,6 +300,13 @@ export function TmuxPanel({ theme, layout, params }: PluginAgentPanelProps) {
           </View>
         </View>
       ))}
+      </View>
+
+      {panes.length === 0 && snapshot?.exists ? (
+        <View style={styles.card}>
+          <Text style={styles.muted}>{"This session has no panes."}</Text>
+        </View>
+      ) : null}
 
       <Modal
         title={`Pane ${detailPane?.paneId ?? ""}`}
@@ -273,6 +319,121 @@ export function TmuxPanel({ theme, layout, params }: PluginAgentPanelProps) {
           <Text style={styles.screen_}>{detailPane?.text ?? ""}</Text>
         </Modal.Content>
       </Modal>
+    </View>
+  );
+}
+
+interface WorkspaceAgentOption {
+  id: string;
+  provider: string;
+  status: string;
+}
+
+const AGENT_LIST_INTERVAL_MS = 5000;
+
+/**
+ * Workspace-scoped copy of the same view. Paseo's "+" new-tab menu lists only
+ * workspace-context panels, so this is the entry point that is always
+ * reachable from the tab strip; it resolves the agent from the workspace.
+ */
+export function TmuxWorkspacePanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
+  const paseo = usePaseo();
+  const [agents, setAgents] = useState<WorkspaceAgentOption[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const result = await paseo.agents.list({ page: { limit: 100 } });
+        if (cancelled) return;
+        const options: WorkspaceAgentOption[] = [];
+        for (const entry of result.entries) {
+          const agent = entry.agent;
+          if (!agent || agent.workspaceId !== workspaceId) continue;
+          options.push({
+            id: agent.id,
+            provider: String(agent.provider ?? "?"),
+            status: String(agent.status ?? "?"),
+          });
+        }
+        setAgents(options);
+        setSelected((current) =>
+          current && options.some((option) => option.id === current)
+            ? current
+            : (options[0]?.id ?? null),
+        );
+        setLoadError(null);
+      } catch (caught) {
+        if (!cancelled) setLoadError(caught instanceof Error ? caught.message : String(caught));
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), AGENT_LIST_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [paseo, workspaceId]);
+
+  const styles = useMemo(
+    () => ({
+      screen: {
+        flex: 1,
+        padding: layout.compact ? 12 : 20,
+        gap: 12,
+        backgroundColor: theme.colors.surface0,
+      },
+      card: {
+        backgroundColor: theme.colors.surface1,
+        borderColor: theme.colors.border,
+        borderWidth: 1,
+        borderRadius: 10,
+        padding: 12,
+        gap: 6,
+      },
+      muted: { color: theme.colors.foregroundMuted, fontSize: 12 },
+      danger: { color: theme.colors.statusDanger, fontSize: 12 },
+      row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
+    }),
+    [layout.compact, theme],
+  );
+
+  return (
+    <View style={styles.screen}>
+      <View style={styles.card}>
+        {loadError ? <Text style={styles.danger}>{loadError}</Text> : null}
+        {agents.length === 0 && !loadError ? (
+          <Text style={styles.muted}>{"No agents in this workspace."}</Text>
+        ) : null}
+        {agents.map((agent) => (
+          <Pressable
+            key={agent.id}
+            accessibilityRole="button"
+            onPress={() => setSelected(agent.id)}
+            style={styles.row}
+          >
+            <Icon
+              name={agent.id === selected ? "CircleDot" : "Circle"}
+              size={14}
+              color={agent.id === selected ? theme.colors.accent : theme.colors.foregroundMuted}
+            />
+            <Text style={styles.muted}>
+              {`${agent.provider} · ${agent.status} · ${agent.id.slice(0, 8)}`}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+      {selected ? (
+        <TmuxPanelBody theme={theme} layout={layout} agentId={selected} />
+      ) : (
+        <View style={styles.card}>
+          <Text style={styles.muted}>
+            {"Pick an agent, or use /tmux in the composer for this agent's panes."}
+          </Text>
+        </View>
+      )}
     </View>
   );
 }

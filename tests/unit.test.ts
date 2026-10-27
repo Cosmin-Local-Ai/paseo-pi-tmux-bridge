@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  AMOS_IDENTITY_ENV_KEYS,
   AMOS_LAYOUT,
   DEFAULT_LAYOUT,
   DEFAULT_PLACEHOLDER_CMD,
@@ -87,6 +88,86 @@ test("only interactive pi sessions are handled", () => {
   assert.equal(shouldHandleSessionOpen({ provider: "claude", purpose: "interactive" }), false);
   assert.equal(shouldHandleSessionOpen({ provider: "codex", purpose: "history" }), false);
   assert.equal(shouldHandleSessionOpen({ provider: "Pi", purpose: "interactive" }), false);
+});
+
+test("providers derived from pi are handled, unrelated ones are not", () => {
+  // Paseo reports a custom provider's own id, never "pi".
+  for (const provider of ["pi-recovery", "recovery-pi", "local_pi", "pi.local", "pi"]) {
+    assert.equal(
+      shouldHandleSessionOpen({ provider, purpose: "interactive" }),
+      true,
+      `${provider} must be treated as pi`,
+    );
+  }
+  for (const provider of ["pilot", "openapi", "claude", "codex", "copilot", "opencode", "muse"]) {
+    assert.equal(
+      shouldHandleSessionOpen({ provider, purpose: "interactive" }),
+      false,
+      `${provider} must not be treated as pi`,
+    );
+  }
+  // An explicit id wins even when the heuristic is off; an unlisted one is skipped.
+  assert.equal(
+    shouldHandleSessionOpen(
+      { provider: "pilot", purpose: "interactive" },
+      { extraProviderIds: ["pilot"], autoDetect: false },
+    ),
+    true,
+  );
+  assert.equal(
+    shouldHandleSessionOpen(
+      { provider: "pi-recovery", purpose: "interactive" },
+      { autoDetect: false },
+    ),
+    false,
+  );
+  assert.equal(
+    shouldHandleSessionOpen({ provider: "pi-recovery", purpose: "history" }),
+    false,
+    "purpose still gates the hook",
+  );
+});
+
+test("Amos identity variables are stripped from the injected env by default", () => {
+  const base = {
+    PATH: "/usr/bin",
+    PI_SUBAGENT_AGENT: "worker",
+    PI_SUBAGENT_NAME: "worker-fix",
+    PI_SUBAGENT_ID: "e6ff031e",
+    PI_SUBAGENT_ALLOWED: "scout,researcher",
+    PI_SUBAGENT_AUTO_EXIT: "1",
+    PI_SUBAGENT_SURFACE: "%1",
+    PI_SUBAGENT_SESSION: "/tmp/s.jsonl",
+    PI_SUBAGENT_ACTIVITY_FILE: "/tmp/a.json",
+    PI_SESSION_FILE: "/tmp/p.jsonl",
+  };
+  const env = buildInjectedEnv(base, {
+    socketPath: "/tmp/tmux-1000/default",
+    pid: 1,
+    paneId: "%3",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 2000,
+  });
+  for (const key of AMOS_IDENTITY_ENV_KEYS) {
+    assert.equal(env[key], undefined, `${key} must not reach a top-level agent`);
+  }
+  assert.equal(env.PI_SESSION_FILE, "/tmp/p.jsonl", "unrelated Pi vars survive");
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(base.PI_SUBAGENT_AGENT, "worker", "the caller's object is not mutated");
+
+  const kept = buildInjectedEnv(base, {
+    socketPath: "/tmp/tmux-1000/default",
+    pid: 1,
+    paneId: "%3",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 2000,
+    stripAmosIdentity: false,
+  });
+  assert.equal(kept.PI_SUBAGENT_AGENT, "worker");
+
+  const soft = buildTmuxUnavailableEnv(base, { shellReadyDelayMs: 2000 });
+  assert.equal(soft.PI_SUBAGENT_AGENT, undefined);
+  assert.equal(soft.TMUX, "");
 });
 
 // ── env construction ───────────────────────────────────────────────────────

@@ -433,3 +433,281 @@ plugin's `agent.archived` kill path worked on the first correct call.
 Still not verified after this pass: the client panel/UI was never rendered (no Paseo app was opened), the
 6 RPC handlers were never exercised from a real client, `agent.closed` (as opposed to `agent.archived`)
 was never observed firing, and `resume`/`refresh`/`import` remain unit-tested only.
+
+---
+
+# 2026-10-27 (second pass) — "it doesn't do anything": reproduced, root-caused, fixed, proven in the rendered UI
+
+Everything in this section was run against a scratch home (`/tmp/paseo-verify-home`), never
+`/home/cosmin/.paseo`. The Paseo checkout stayed untouched (verified at the end). The client UI was
+rendered for real: the daemon served the browser app and the browser tools drove it. Screenshots are
+under `evidence/` (each verified with `details.artifactVerification` before being trusted).
+
+Environment: daemon from the clean `v0.13.2` checkout (`npx tsx packages/cli/src/index.ts daemon start
+--home /tmp/paseo-verify-home`), web UI built once into a **copy** of the repo at `/tmp/paseo-build`
+(the read-only checkout was never built in) and served through
+`features.webUi.distDir = /tmp/paseo-build/packages/server/dist/server/web-ui`.
+
+## 1. The user's install was already healthy — the plugin was running and doing nothing
+
+Read-only inspection of the real `~/.paseo` (config + log only; nothing was written, no CLI call was
+made against that home):
+
+- `config.json` already has `"pluginsEnabled": true` and
+  `"pi-tmux-bridge": { "source": "directory", "path": ".../pi-tmux-bridge/<uuid>/checkout", "enabled": true }`.
+- `daemon.log` shows the plugin loaded fine:
+
+  ```text
+  ... "pluginId":"pi-tmux-bridge" ... "message":"[pi-tmux-bridge] ready (prefix=\"paseo-\" ...)"
+  ... "pluginId":"pi-tmux-bridge","methods":["capture-pane","kill-pane","list-panes",
+      "open-attach-terminal","select-pane","session-status","settings.pi-tmux-bridge.*"],"providers":[]
+  ```
+
+- **Zero** `[pi-tmux-bridge] agent <id> -> tmux ...` lines exist in the whole log, while the same log
+  contains 73 records with `"provider":"pi-recovery"`:
+
+  ```text
+  $ grep -o '"provider":"[a-z0-9-]*"' ~/.paseo/daemon.log | sort | uniq -c
+       110 "provider":"local"
+        73 "provider":"pi-recovery"
+  ```
+
+So: installed, trusted, enabled, running — and never acted. "Doesn't do anything" is accurate.
+
+Also in that log, an earlier install attempt failed because a bare repo slug is not a valid source:
+
+```text
+Error: Plugin source is neither an existing directory nor a Git URL: Cosmin-Local-Ai/paseo-pi-tmux-bridge
+```
+
+Use a directory path or a full `https://github.com/<owner>/<repo>.git` URL.
+
+## 2. Root cause A (server) — the provider guard rejected the user's provider
+
+`shouldHandleSessionOpen()` required `provider === "pi"` exactly. Paseo sends the **derived** provider
+id: `agent-manager.ts` builds the hook request with `provider: client.provider`, and a provider
+declared `extends: "pi"` (`provider-registry.ts`) registers under its own id. The user's only enabled
+Pi provider is `pi-recovery`.
+
+Reproduced side by side in the scratch daemon (`/tmp/paseo-verify-home`), same plugin build:
+
+```text
+pi agent:          89041405-582b-4690-9ee3-219c3634bc30
+pi-recovery agent: b224bb60-ea6d-41c0-9bbf-fc954b6063de
+
+$ paseo plugin logs pi-tmux-bridge
+[pi-tmux-bridge] agent 89041405-… (create) -> tmux paseo-89041405-… pane %2 (created)
+[pi-tmux-bridge] opened attach terminal 94c212d3-… for agent 89041405-…
+(no line at all for b224bb60-…)
+
+$ tmux ls
+paseo-89041405-582b-4690-9ee3-219c3634bc30: 1 windows ... (attached)     # pi agent
+                                                                          # pi-recovery agent: none
+$ tr '\0' '\n' < /proc/1474/environ | grep -E '^(TMUX|TMUX_PANE|PASEO_TMUX_SESSION|…)'
+TMUX=/tmp/tmux-1000/default,1185,0
+TMUX_PANE=%2
+PASEO_TMUX_SESSION=paseo-89041405-…
+PI_SUBAGENT_SHELL_READY_DELAY_MS=2000
+
+$ tr '\0' '\n' < /proc/1626/environ | grep -E '^(TMUX|PASEO_TMUX_SESSION)='
+(no match — the pi-recovery agent got no tmux env at all)
+```
+
+`/proc/<pid>/environ` is the strongest available proof: the hook never ran for that provider, so Amos
+falls back to its own "Subagents require tmux" error.
+
+**Fix** (`server/tmux.ts`): `isPiProviderId()` matches `pi`, any id with a delimited `pi` token
+(`pi-recovery`, `recovery-pi`, `local_pi`, `pi.local`) — deliberately not `pilot`/`openapi` — plus an
+explicit `piProviders` setting and `autoDetectPiProviders` switch. The hook now also logs the first
+skip of an unmatched provider so the situation is visible in `paseo plugin logs`.
+
+After the fix, the same `pi-recovery` agent:
+
+```text
+$ paseo agent reload b224bb60-…
+AGENT ID                              STATUS    TIMELINE
+b224bb60-ea6d-41c0-9bbf-fc954b6063de  reloaded  3
+$ paseo plugin logs pi-tmux-bridge
+[pi-tmux-bridge] agent b224bb60-… (refresh) -> tmux paseo-b224bb60-… pane %4 (created)
+[pi-tmux-bridge] opened attach terminal 23d50c7b-… for agent b224bb60-…
+$ tmux ls
+paseo-b224bb60-ea6d-41c0-9bbf-fc954b6063de: 1 windows ... (attached)
+```
+
+Note `reason: "refresh"` — this also proves the hook fires on refresh, which was previously only
+unit-tested.
+
+## 3. Root cause B (client) — one invalid id killed the whole client bundle
+
+The host validates every client contribution id against
+`CONTRIBUTION_ID = /^[a-z][a-z0-9-]*$/` (`packages/app/src/plugins/evaluate.ts`). The plugin used
+dotted ids (`pi-tmux-bridge.open`, `pi-tmux-bridge.settings`). `requireId` throws inside
+`contribute()`, and the host then discards the **entire** client bundle. Captured from the live app
+console (buffer cleared, then the page reloaded, so this is the current load):
+
+```text
+[Plugins] Failed to evaluate srv_1dof_l9RQW90/pi-tmux-bridge
+Error: Invalid Command Center item id: pi-tmux-bridge.open
+    at Object.addCommandCenterItem
+    at contribute (eval at _e.runPluginClientBundle (…/index-825db5a3e4b11dd912af9a672e652558.js:16910:7750), <anonymous>:581:31)
+    at _e.runPluginClientBundle (…)
+```
+
+Consequences, all confirmed in the UI before the fix: the panel did not exist, the settings screen did
+not exist, and the Command Center said **"No matches"** for `tmux`. `tsc` and `compilePlugin()` could
+not see this — it is a runtime host-validation failure.
+
+**Fix:** ids are now `tmux`, `tmux-workspace`, `pi-tmux-bridge`, `open-panel`,
+`open-attach-terminal`, `configure`, and slash command `tmux`. `tests/compile-check.mjs` now extracts
+every contribution id (inline and constant) from `index.client.tsx` and fails the build if one does
+not match the host rule, so this cannot regress. After reload + reload, the console error is gone:
+
+```text
+$ agent-browser console errors     # buffer cleared, page reloaded
+1. [warning] Animated: `useNativeDriver` is not supported …   # only the benign RN warning
+```
+
+## 4. Root cause C (client) — an agent panel has no discoverability at all
+
+Paseo's `+` launcher lists plugin panels only when `panel.context === "workspace"`
+(`packages/app/src/workspace-tabs/launcher/index.tsx`: `if (panel.context !== "workspace") continue;`).
+`addAgentPanel` registers context `agent`, and the only way to open an agent panel is a plugin's own
+`openPanel()` call (`packages/app/src/plugins/navigation.ts` — `openAgentPanel` has no other callers).
+The old client registered a panel and command items that never opened it, so even with the id bug
+fixed there was **no way to reach the panel**.
+
+**Fix:** the same view is registered as an agent panel (`tmux`) and a workspace panel
+(`tmux-workspace`, appears in the `+` menu and picks the agent from the workspace), plus a Command
+Center item and a `/tmux` slash command that call `openPanel("tmux", { location: "explorer" })`.
+`explorer` docks the panel in the explorer pane, **side by side with the agent chat**, and Paseo
+persists that pane per workspace — which is what the user asked for ("see them side by side to the
+main session, spawning on the right, not having to click anything to see the sessions somewhere
+else"). Pane cards in the panel now also lay out left→right in tmux index order.
+
+## 5. Root cause D (client, found only by rendering) — `SidebarRow` is not a general-purpose row
+
+With ids fixed and the panel reachable, the panel rendered as:
+
+```text
+Plugin failed: SidebarRow must render inside a sidebar item
+```
+
+(`packages/app/src/plugins/sidebar-items/frame.ts` — `SidebarRow` requires a sidebar-item frame.)
+Both pane rows and the new agent picker used it. Replaced with plain `Pressable` + `Icon` + `Text`.
+No static check could have found this.
+
+## 6. Visual proof, in order
+
+| file | what it shows |
+| --- | --- |
+| `evidence/01-daemon-web-ui-home.png` | daemon serving the real Paseo web app, connected to the scratch daemon |
+| `evidence/02-agent-view-pi-recovery.png` | the `bridge-recovery` (provider `pi-recovery`) agent; no plugin UI anywhere |
+| `evidence/03-new-tab-menu-no-plugin-panel.png` | **before**: `+` menu = Agent, Terminal, Claude Code, Codex, OpenCode, Pi — no plugin panel |
+| `evidence/04-command-center-tmux-items.png` | **before**: Command Center search `tmux` → **"No matches"** |
+| `evidence/05-new-tab-menu-with-tmux-panes.png` | **after**: `+` menu now lists **tmux panes** |
+| `evidence/06-tmux-panel-open-pi-recovery-agent.png` | panel renders for the `pi-recovery` agent: session name, 0 panes, "No tmux session for this agent yet" (pre-fix state) |
+| `evidence/07-tmux-panel-rendered-workspace.png` | panel body renders (agent picker, buttons, warning) — proves the RPC round-trip |
+| `evidence/08-tmux-panel-pi-recovery-session-with-pane.png` | after `agent reload`: 1 pane `%4 · bash · 220x49` with real captured shell text, and a `tmux attach -t paseo-…` tab appeared on its own |
+| `evidence/09-attach-terminal-tab.png` | the auto attach terminal really runs `tmux attach` — prompt plus the green tmux status bar `[paseo-b224bb60(bash)]` |
+| `evidence/10-attach-terminal-two-panes-side-by-side.png` | **the feature**: real Amos `subagent` call → two panes side by side, right pane is the worker's Pi TUI showing the task text |
+| `evidence/11-tmux-panel-two-panes-captured.png` | panel lists both panes with real captured content (`%4 … pi-recovery-test`, `%5 … pi-bridge-ws` worker text) |
+| `evidence/12-panel-panes-side-by-side.png` | panel now renders panes left→right: main session left, worker subagent right |
+| `evidence/13-slash-command-tmux-autocomplete.png` | agent chat with the `worker` subagent turn visible; `/tmux` typed in the composer |
+| `evidence/14-command-center-plugin-items.png` | Command Center `tmux` → `pi-tmux-bridge` section: Open tmux panel / Configure / Open attach terminal |
+| `evidence/15-panel-explorer-side-by-side-with-chat.png` | **the answer to the request**: tmux panel docked in the explorer pane beside the chat, showing both panes with live content |
+
+## 7. Amos identity variables
+
+The first e2e run of the previous pass hit Amos's self-spawn guard because the daemon leaked
+`PI_SUBAGENT_AGENT=worker` into the agent. `buildInjectedEnv`/`buildTmuxUnavailableEnv` now strip
+`PI_SUBAGENT_AGENT|NAME|ID|ALLOWED|AUTO_EXIT|SURFACE|SESSION|ACTIVITY_FILE` by default
+(`stripAmosIdentity: true`), since a Paseo agent is always a top-level Pi session. Unit-tested,
+including that `PI_SESSION_FILE` and unrelated vars survive and the caller's object is not mutated.
+
+## 8. Also fixed
+
+- `autoAttachTerminal` was declared as a setting but never honoured — the attach terminal was created
+  unconditionally. Now gated.
+
+## 9. Tests / compile status after the changes
+
+```text
+$ node --test tests/unit.test.ts
+ℹ tests 28
+ℹ pass 28
+ℹ fail 0
+
+$ CHECKOUT=/home/cosmin/paseo-pi-subagent-fix npx --prefix "$CHECKOUT" tsx tests/compile-check.mjs
+{
+  "contributionIdsChecked": 7,
+  "badContributionIds": [],
+  "serverBundleBytes": 30641,
+  "clientBundleBytes": 31028,
+  "serverHasContribute": true,
+  "serverRegistersSessionOpen": true,
+  "serverHasKillGuard": true,
+  "clientHasAgentPanel": true,
+  "clientHasRpcNames": [ … 6 ],
+  "serverHasRpcNames": [ … 6 ]
+}
+compile-check: PASS
+```
+
+`npx tsc --noEmit -p tsconfig.json` → exit 0.
+
+## 9b. Bug found while cleaning up: orphaned tmux sessions after `plugin reload`
+
+Archiving the two test agents did **not** kill their sessions. Cause: `BridgeBookkeeping` lives in the
+plugin instance, so after `paseo plugin reload` (or a daemon restart) the map is empty and
+`handleAgentGone` returned at `if (!record) return;`. Every session created before a reload leaked.
+
+Fix: cleanup no longer depends on the map. It re-derives the session name from the settings prefix
+plus the agent id, finds the attach terminal by its deterministic name through an unscoped
+`paseo.terminals.list()`, and keeps the `isOwnSessionName` guard so only a name this plugin could have
+produced is ever killed. Proven by creating a session, reloading the plugin (map emptied), then
+archiving:
+
+```text
+$ paseo plugin reload pi-tmux-bridge          # bookkeeping map is now empty
+$ paseo archive --force 0015e0bb-83e2-4e23-9861-8acd584a5de7
+[pi-tmux-bridge] killed attach terminal f7fa7591-2714-4647-a130-601d20956483 for agent 0015e0bb-…
+[pi-tmux-bridge] killed tmux session paseo-0015e0bb-83e2-4e23-9861-8acd584a5de7 (archived)
+```
+
+Sessions created by the **unfixed** build stayed orphaned (no further event fires for an archived
+agent), so they were removed by hand: `tmux kill-session -t paseo-<agentId>` for the two ids this pass
+created. Cosmetic note: `agent.closed` and `agent.archived` can both land in the same tick, so the
+second handler pass logs `tmux kill-session … failed: can't find session` after the first succeeded.
+
+## 10. Checkout integrity and cleanup
+
+```text
+$ cd /home/cosmin/paseo-pi-subagent-fix && git status --short | head -5; git stash list; git log --oneline -1
+stash@{0}: On (no branch): chatgpt-attempt: in-daemon pi-interactive-subagents adapter + registry registration
+d294115 chore(release): cut 0.13.2
+```
+
+`git status --short` printed nothing. The web UI was built in a copy (`/tmp/paseo-build`), not in the
+checkout. `~/.paseo` was never written to and no command was run against it.
+
+Cleanup: every scratch agent was archived, sessions created under the fixed build were killed by the
+plugin itself, and the two sessions orphaned by the pre-fix build were killed by hand. No `paseo-*`
+session created during this pass remains:
+
+```text
+$ tmux ls | grep -c '^paseo-'
+0
+```
+
+## 11. Still not proven after this pass
+
+- `agent.closed` (only `agent.archived` and the reload/refresh path were observed firing).
+- `reason: "resume"` / `"import"` against a live daemon (`create` and `refresh` were both observed).
+- Submitting `/tmux` by hand: the composer is a React-controlled input and the automation `fill` did
+  not commit app state, so the slash command was typed but not submitted. The Command Center item
+  calls the identical `openPanel("tmux", { location: "explorer" })` and is proven end to end.
+- The desktop app itself (Electron) — verification used the daemon-served web client at
+  `http://127.0.0.1:6767`, i.e. the same React Native/Expo client code and the same plugin client
+  bundle path.
+- Two concurrent agents **after** this pass's changes (proven in the previous pass, unchanged code
+  paths).

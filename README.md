@@ -18,7 +18,13 @@ splits off `process.env.TMUX_PANE`. Two consequences follow:
 
 ## What this plugin does
 
-On `agent.session_open` for `provider === "pi"` and `purpose === "interactive"`:
+On `agent.session_open` for an interactive **Pi** session:
+
+- `purpose` must be `"interactive"` (`history` / `import` sessions are left alone).
+- The provider must be Pi. Paseo reports a custom provider's **own** id, never `"pi"`: a provider
+  declared as `extends: "pi"` (for example `pi-recovery`) arrives as `provider: "pi-recovery"`.
+  Any provider id containing a `pi` token (`pi`, `pi-recovery`, `local_pi`, `my.pi`) is matched, and
+  `piProviders` lets you list exact ids. `pilot` and `openapi` do not match.
 
 1. Creates (or reuses) a private tmux session named `<sessionPrefix><agentId>` — default prefix
    `paseo-` — with a long-lived placeholder pane (`$SHELL -l`, falling back to `tail -f /dev/null`).
@@ -37,6 +43,9 @@ On `agent.session_open` for `provider === "pi"` and `purpose === "interactive"`:
 
 4. Opens a Paseo terminal in the agent's workspace running `tmux attach -t <session>`, so the
    subagent panes appear side by side. Creation is fire-and-forget; it never blocks or fails launch.
+   Amos identity variables (`PI_SUBAGENT_*`) inherited from the daemon are stripped from the launch
+   env by default (`stripAmosIdentity`), otherwise Amos treats the agent as an existing subagent and
+   refuses to spawn one.
 5. On `agent.closed` / `agent.archived`, kills the attach terminal and — only when the session name
    is exactly this plugin's prefix plus this agent's id — kills the tmux session.
 
@@ -62,12 +71,27 @@ There is no plugin watch mode; the dev loop is `paseo plugin reload pi-tmux-brid
 
 Requirements: `tmux` on the **daemon host**'s PATH (verified with tmux 3.6), Paseo >= 0.13.0.
 
-## Use
+## Use — how to actually see it
 
-Open the **tmux** panel on any Pi agent. It polls every 2s and shows the session name, pane count,
-and per pane: id, index, `pane_current_command`, pid, title, size, and the last N captured screen
-lines. Buttons: **Focus** (`select-pane`), **Kill pane** (`kill-pane`), **Open attach terminal**.
-Clicking a pane row opens a modal with a longer capture.
+Paseo's tab launcher only lists **workspace**-context panels, so the plugin registers the view twice
+and adds three ways in:
+
+| entry point | where the view lands |
+| --- | --- |
+| `+` (new tab) → **tmux panes** | a workspace tab; picks the agent for you |
+| Command Center (`Search`) → **Open tmux panel for this agent** | the **explorer pane**, docked beside the agent chat |
+| `/tmux` in the agent composer | the explorer pane |
+| Command Center → **Open attach terminal for this agent** | a `tmux attach -t <session>` terminal tab |
+| Command Center → **Configure Pi tmux bridge** | the settings screen |
+
+The explorer placement is the one that answers "I want to see the panes next to the session, without
+clicking around": the panel stays docked on the right, polls every 2s, and a subagent that tmux
+splits to the right shows up on the right — main pane and subagent pane side by side. Paseo persists
+the explorer pane per workspace, so after opening it once it is there again on the next visit.
+
+The panel shows the session name, pane count, and per pane: id, index, `pane_current_command`, pid,
+title, size, and the last N captured screen lines. Buttons: **Focus** (`select-pane`), **Kill pane**
+(`kill-pane`), **Open attach terminal**. Clicking a pane header opens a modal with a longer capture.
 
 Then just ask the agent to use the `subagent` tool as you would inside tmux.
 
@@ -85,6 +109,9 @@ Then just ask the agent to use the `subagent` tool as you would inside tmux.
 | `autoAttachTerminal` | `true` | open the attach terminal automatically |
 | `killOnClose` | `true` | kill the session on close/archive |
 | `paneCaptureLines` | `15` | capture depth in the panel |
+| `autoDetectPiProviders` | `true` | treat `pi`-derived provider ids (`pi-recovery`, …) as Pi |
+| `piProviders` | `[]` | exact extra provider ids to treat as Pi |
+| `stripAmosIdentity` | `true` | drop inherited `PI_SUBAGENT_*` vars from the agent env |
 
 ## Layout
 
@@ -115,18 +142,12 @@ name is never accepted from the client.
 
 ## Known traps
 
-1. **Do not start the Paseo daemon from inside an Amos subagent pane.** Paseo passes its own
-   environment down to agents, so the agent inherits `PI_SUBAGENT_AGENT` / `PI_SUBAGENT_NAME`, and
-   Amos's self-spawn guard then refuses `subagent({agent: "worker"})` with *"You are the worker
-   agent — do not start another worker."* This is Paseo's env inheritance meeting Amos's identity
-   variables, not a bug in this plugin. Start the daemon from a clean shell, or explicitly:
-
-   ```bash
-   env -u PI_SUBAGENT_AGENT -u PI_SUBAGENT_NAME -u PI_SUBAGENT_ALLOWED -u PI_SUBAGENT_AUTO_EXIT \
-     paseo daemon restart
-   ```
-
-   This plugin deliberately does **not** strip those variables, because they are not its own state.
+1. **A daemon started inside an Amos subagent pane used to poison every agent.** Paseo passes its own
+   environment down, so an agent inherited `PI_SUBAGENT_AGENT` / `PI_SUBAGENT_NAME`, and Amos's
+   self-spawn guard then refused `subagent({agent: "worker"})` with *"You are the worker agent — do
+   not start another worker."* The plugin now removes the `PI_SUBAGENT_*` identity variables from the
+   launch env by default (`stripAmosIdentity: true`), because a Paseo agent is always a top-level Pi
+   session. Set it to `false` if you genuinely want them forwarded.
 2. **`pane_current_command` usually reads `bash`, not `pi`**, for Amos subagents: Amos launches the
    child through a non-interactive `bash` script that owns the pane's foreground process group. The
    panel still shows the field, but do not treat it as an "is a subagent running here" signal.
@@ -139,7 +160,7 @@ name is never accepted from the client.
 ```bash
 export CHECKOUT=$HOME/src/paseo                 # any Paseo checkout >= 0.13.0
 
-node --test tests/unit.test.ts                  # 26 unit tests, no daemon needed
+node --test tests/unit.test.ts                  # 28 unit tests, no daemon needed
 
 # typecheck against the Paseo SDK (tsconfig.json is local-only; generate it once)
 sed "s|<paseo-checkout>|$CHECKOUT|g" tsconfig.example.json > tsconfig.json
@@ -153,10 +174,13 @@ bash tests/concurrent-agents-check.sh           # two agents at once -> disjoint
 
 ## Verification status
 
-Proven: 26/26 unit tests, Paseo's own `compilePlugin()`, a real daemon loading the plugin
-(`STATUS = running`), a real Pi agent spawning a real second pane (`BRIDGE_OK`), and **two agents at
-once getting disjoint panes**. Not proven: the client panel has never been rendered in a real Paseo
-app, the RPC handlers have never been called from a real client, and `agent.closed` (as opposed to
-`agent.archived`) has never been observed firing.
+Proven, including in a real rendered Paseo app (screenshots in `evidence/`, details in
+`VERIFICATION.md`): 28/28 unit tests, Paseo's own `compilePlugin()`, a daemon loading the plugin
+(`STATUS = running`), a `pi` agent **and** a `pi-recovery` (custom provider) agent each getting their
+own session and injected env, the attach terminal appearing as a tab in the UI, the panel rendering
+side by side with the chat in the explorer pane, both panes listed with real captured content, and
+**two agents at once getting disjoint panes**. Not proven: `agent.closed` (as opposed to
+`agent.archived`) firing, `resume`/`import` in a live daemon, and submitting `/tmux` by hand (the
+command-center path to the same panel is proven).
 
 See `VERIFICATION.md` for exactly what was run and what the output was.

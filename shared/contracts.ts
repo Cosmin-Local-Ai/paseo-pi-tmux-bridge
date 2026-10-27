@@ -26,6 +26,24 @@ export const bridgeSettings = defineSettings({
     placeholderCmd: z.string().trim().min(1).max(200).default("$SHELL -l"),
     shellReadyDelayMs: z.number().int().min(0).max(60000).default(2000),
     autoAttachTerminal: z.boolean().default(true),
+    /**
+     * Paseo reports a custom provider's own id in `agent.session_open`, so a
+     * provider declared as `extends: "pi"` (for example `pi-recovery`) is not
+     * the string `pi`. Any id containing a `pi` token is treated as Pi by
+     * default; list the exact ids here to be explicit or to override a name the
+     * heuristic cannot see.
+     */
+    autoDetectPiProviders: z.boolean().default(true),
+    piProviders: z
+      .array(z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+      .max(32)
+      .default([]),
+    /**
+     * A Paseo agent is a top-level Pi session. Amos identity variables inherited
+     * from the daemon make Amos treat the agent as an existing subagent and
+     * refuse to spawn one.
+     */
+    stripAmosIdentity: z.boolean().default(true),
     killOnClose: z.boolean().default(true),
     paneCaptureLines: z.number().int().min(1).max(500).default(15),
   }),
