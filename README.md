@@ -4,6 +4,26 @@ A Paseo plugin that makes tmux-based Pi extensions behave inside Paseo the way t
 Built for [`amosblomqvist/pi-interactive-subagents`](https://github.com/amosblomqvist/pi-interactive-subagents)
 (the "Amos" interactive subagents extension), which spawns subagents into tmux panes.
 
+## What it looks like
+
+The panel, docked beside the agent chat, showing two panes side by side with live screen captures:
+
+![tmux panel with two panes beside the chat](evidence/15-panel-explorer-side-by-side-with-chat.png)
+
+The same view for a **sandboxed** provider — the session lives inside the container, and the panel
+says so (`sbx:pi-namespaced-test · /usr/bin/tmux`):
+
+![namespaced panel with namespace label](evidence/22-panel-namespaced-namespace-label-two-panes.png)
+
+The auto-opened attach terminal, rendering the namespace's tmux window: host shell on the left, the
+subagent's live Pi TUI on the right:
+
+![attach terminal showing two panes inside the namespace](evidence/21-namespaced-attach-terminal-two-panes.png)
+
+And when tmux cannot be found, the panel states it instead of staying blank:
+
+![tmux not found diagnostic](evidence/18-panel-tmux-not-found-diagnostic.png)
+
 ## The problem
 
 Paseo launches Pi as a **stdio RPC child, not inside a PTY**, so a Pi agent has no tmux
