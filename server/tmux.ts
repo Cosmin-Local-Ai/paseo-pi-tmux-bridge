@@ -12,6 +12,142 @@
 
 export const TMUX_BIN = "tmux";
 
+/**
+ * A Paseo desktop daemon inherits the desktop session's environment, which
+ * frequently does **not** contain the directory tmux lives in (the user's real
+ * daemon logged `tmux is not on PATH` for every agent). Looking tmux up by name
+ * is therefore only the first attempt: the plugin resolves an absolute path and
+ * uses it for every call, and hands the directory to the agent through `PATH`
+ * because Amos itself runs `command -v tmux` inside the agent process.
+ */
+export const TMUX_CANDIDATE_PATHS: readonly string[] = [
+  "/usr/bin/tmux",
+  "/usr/local/bin/tmux",
+  "/usr/local/sbin/tmux",
+  "/opt/homebrew/bin/tmux",
+  "/opt/local/bin/tmux",
+  "/snap/bin/tmux",
+  "$HOME/.local/bin/tmux",
+  "/run/current-system/sw/bin/tmux",
+];
+
+/** Candidate list with `$HOME` substituted; order is the documented probe order. */
+export function tmuxCandidatePaths(home?: string): string[] {
+  const resolvedHome = typeof home === "string" && home.length > 0 ? home.replace(/\/+$/, "") : "";
+  const out: string[] = [];
+  for (const candidate of TMUX_CANDIDATE_PATHS) {
+    if (candidate.startsWith("$HOME")) {
+      if (!resolvedHome) continue;
+      out.push(`${resolvedHome}${candidate.slice("$HOME".length)}`);
+      continue;
+    }
+    out.push(candidate);
+  }
+  return out;
+}
+
+/** argv for resolving tmux through the login shell: `command -v tmux` → path or nothing. */
+export const TMUX_WHICH_ARGS: readonly string[] = ["-lc", "command -v tmux"];
+
+export function parsePathLookup(stdout: string): string | null {
+  const first = (stdout ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!first || !first.startsWith("/") || first.length > 512) return null;
+  return first;
+}
+
+export interface TmuxResolution {
+  path: string | null;
+  /** every location that was tried, in order, for the operator-facing message */
+  tried: string[];
+}
+
+/**
+ * Pure resolver. `exists` is supplied by the caller (the server proves a
+ * candidate by running `<candidate> -V`), so this stays testable without a
+ * filesystem.
+ *
+ * An explicit `tmuxPath` setting is authoritative: when it is set but not
+ * usable the result is a hard failure rather than a silent fallback to some
+ * other tmux, because a wrong override must surface as a visible diagnostic.
+ */
+export function resolveTmuxPath(
+  input: { configured: string; pathLookup: string | null; candidates: readonly string[] },
+  exists: (candidate: string) => boolean,
+): TmuxResolution {
+  const configured = typeof input.configured === "string" ? input.configured.trim() : "";
+  if (configured.length > 0) {
+    return exists(configured)
+      ? { path: configured, tried: [`tmuxPath=${configured}`] }
+      : { path: null, tried: [`tmuxPath=${configured} (not executable)`] };
+  }
+
+  const tried: string[] = [];
+  if (input.pathLookup) {
+    tried.push(`PATH (${input.pathLookup})`);
+    if (exists(input.pathLookup)) return { path: input.pathLookup, tried };
+  } else {
+    tried.push("PATH (command -v tmux: not found)");
+  }
+
+  for (const candidate of input.candidates) {
+    tried.push(candidate);
+    if (exists(candidate)) return { path: candidate, tried };
+  }
+  return { path: null, tried };
+}
+
+/** Directory holding an absolute binary path, or null when it has none. */
+export function binaryDirOf(absolutePath: string | null): string | null {
+  if (!absolutePath) return null;
+  const index = absolutePath.lastIndexOf("/");
+  if (index <= 0) return null;
+  return absolutePath.slice(0, index);
+}
+
+export const PATH_DELIMITER = process.platform === "win32" ? ";" : ":";
+
+/**
+ * Paseo composes the launch env as `{ ...daemonEnv, ...hookEnv }
+ * (provider-launch-config.ts:createExternalProcessEnv)`, so a `PATH` returned by
+ * the hook **replaces** the daemon PATH rather than extending it. `agent.session_open`
+ * hands the hook a sparse env that usually has no PATH at all, so the base for
+ * the injection has to be the daemon's own PATH; inventing a PATH that contains
+ * only the tmux directory would break `spawn pi` with ENOENT.
+ */
+export function pathBaseFor(
+  requestPath: string | undefined,
+  daemonPath: string | undefined,
+): string | undefined {
+  if (typeof requestPath === "string" && requestPath.length > 0) return requestPath;
+  if (typeof daemonPath === "string" && daemonPath.length > 0) return daemonPath;
+  return undefined;
+}
+
+/**
+ * Prepend the tmux directory to PATH without dropping anything the agent
+ * already had, and without duplicating the directory on resume/refresh. An
+ * absent PATH stays absent: a lone tmux directory would shadow the rest of the
+ * environment the daemon is about to spawn.
+ */
+export function prependToPath(
+  existingPath: string | undefined,
+  dir: string | null,
+  delimiter: string = PATH_DELIMITER,
+): string | undefined {
+  if (!dir || existingPath === undefined) return existingPath;
+  const parts = (existingPath ?? "")
+    .split(delimiter)
+    .filter((part) => part.length > 0 && part !== dir);
+  return [dir, ...parts].join(delimiter);
+}
+
+/** What the panel and the log say when nothing resolved. Never a silent blank UI. */
+export const TMUX_MISSING_DETAIL =
+  "tmux not found on daemon host — install tmux or set tmuxPath";
+
 export const DEFAULT_SESSION_PREFIX = "paseo-";
 export const DEFAULT_LAYOUT = "even-horizontal";
 export const DEFAULT_PLACEHOLDER_CMD = "$SHELL -l";
@@ -292,6 +428,9 @@ export interface InjectedEnvOptions {
   shellReadyDelayMs: number;
   /** Default true: never let the daemon's Amos identity reach a top-level agent. */
   stripAmosIdentity?: boolean;
+  /** Absolute path of the tmux the plugin resolved, so Amos can find `tmux`. */
+  tmuxPath?: string | null;
+  pathDelimiter?: string;
 }
 
 /**
@@ -302,8 +441,13 @@ export function buildInjectedEnv(
   base: Record<string, string>,
   options: InjectedEnvOptions,
 ): Record<string, string> {
+  // Amos runs `command -v tmux` inside the agent, so the agent must be able to
+  // find the same tmux the plugin resolved, even when the daemon's PATH has no
+  // directory for it.
+  const path = prependToPath(base.PATH, binaryDirOf(options.tmuxPath ?? null), options.pathDelimiter);
   return {
     ...(options.stripAmosIdentity === false ? base : stripAmosIdentity(base)),
+    ...(path === undefined ? {} : { PATH: path }),
     TMUX: `${options.socketPath},${options.pid},0`,
     TMUX_PANE: options.paneId,
     [SESSION_ENV_KEY]: options.sessionName,
@@ -319,10 +463,17 @@ export function buildInjectedEnv(
  */
 export function buildTmuxUnavailableEnv(
   base: Record<string, string>,
-  options: { shellReadyDelayMs: number; stripAmosIdentity?: boolean },
+  options: {
+    shellReadyDelayMs: number;
+    stripAmosIdentity?: boolean;
+    tmuxPath?: string | null;
+    pathDelimiter?: string;
+  },
 ): Record<string, string> {
+  const path = prependToPath(base.PATH, binaryDirOf(options.tmuxPath ?? null), options.pathDelimiter);
   return {
     ...(options.stripAmosIdentity === false ? base : stripAmosIdentity(base)),
+    ...(path === undefined ? {} : { PATH: path }),
     TMUX: "",
     TMUX_PANE: "",
     [SESSION_ENV_KEY]: "",

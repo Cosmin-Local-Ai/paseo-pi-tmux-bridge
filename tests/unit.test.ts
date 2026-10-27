@@ -31,12 +31,20 @@ import {
   newSessionCmd,
   parsePaneId,
   parsePaneRows,
+  parsePathLookup,
   parseSocketPath,
+  pathBaseFor,
+  prependToPath,
+  binaryDirOf,
   resolvePlaceholderCommand,
+  resolveTmuxPath,
   selectLayoutCmd,
   selectPaneCmd,
   sessionNameFor,
   shouldHandleSessionOpen,
+  tmuxCandidatePaths,
+  TMUX_CANDIDATE_PATHS,
+  TMUX_MISSING_DETAIL,
 } from "../server/tmux.ts";
 import type { TmuxRun, TmuxRunResult } from "../server/tmux.ts";
 import { BridgeBookkeeping } from "../server/bookkeeping.ts";
@@ -202,6 +210,89 @@ test("buildInjectedEnv does not mutate the request env", () => {
     shellReadyDelayMs: 0,
   });
   assert.deepEqual(base, { PATH: "/usr/bin" });
+});
+
+test("buildInjectedEnv prepends the resolved tmux directory to the agent PATH", () => {
+  // Amos runs `command -v tmux` inside the agent, so the agent must be able to
+  // find tmux even when the daemon's PATH has no directory for it.
+  const base = { PATH: "/usr/local/bin:/home/cosmin/.local/bin", KEEP: "1" };
+  const env = buildInjectedEnv(base, {
+    socketPath: "/s",
+    pid: 1,
+    paneId: "%1",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 0,
+    tmuxPath: "/usr/bin/tmux",
+  });
+  assert.equal(env.PATH, "/usr/bin:/usr/local/bin:/home/cosmin/.local/bin");
+  assert.equal(env.KEEP, "1");
+  assert.ok(env.PATH.split(":").includes("/usr/bin"));
+});
+
+test("buildInjectedEnv leaves PATH alone when nothing resolved and does not duplicate it", () => {
+  const noTmux = buildInjectedEnv({ PATH: "/usr/bin" }, {
+    socketPath: "/s",
+    pid: 1,
+    paneId: "%1",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 0,
+    tmuxPath: null,
+  });
+  assert.equal(noTmux.PATH, "/usr/bin");
+
+  const already = buildInjectedEnv({ PATH: "/usr/bin:/bin" }, {
+    socketPath: "/s",
+    pid: 1,
+    paneId: "%1",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 0,
+    tmuxPath: "/usr/bin/tmux",
+  });
+  assert.equal(already.PATH, "/usr/bin:/bin", "resume/refresh must not duplicate the directory");
+});
+
+test("buildInjectedEnv never emits a PATH that holds only the tmux directory", () => {
+  // Paseo replaces the daemon PATH with the hook PATH, so a lone directory would
+  // break `spawn pi` with ENOENT.
+  const env = buildInjectedEnv({ HOME: "/home/cosmin" }, {
+    socketPath: "/s",
+    pid: 1,
+    paneId: "%1",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 0,
+    tmuxPath: "/snap/bin/tmux",
+  });
+  assert.equal(env.PATH, undefined, "no base PATH means leave PATH to the daemon");
+  assert.equal(env.TMUX, "/s,1,0", "the bridge keys are still injected");
+});
+
+test("pathBaseFor falls back to the daemon PATH, which is what the hook replaces", () => {
+  assert.equal(pathBaseFor("/a:/b", "/c:/d"), "/a:/b");
+  assert.equal(pathBaseFor(undefined, "/c:/d"), "/c:/d");
+  assert.equal(pathBaseFor("", "/c:/d"), "/c:/d");
+  assert.equal(pathBaseFor(undefined, undefined), undefined);
+});
+
+test("the hook env keeps the daemon PATH and gains the tmux directory", () => {
+  // Mirrors what index.server.ts does: request.env is usually sparse.
+  const requestEnv: Record<string, string> = { KEEP: "1" };
+  const daemonPath = "/tmp/no-tmux-bin:/usr/local/bin:/usr/local/share/npm-global/bin";
+  const pathBase = pathBaseFor(requestEnv.PATH, daemonPath);
+  const base: Record<string, string> = pathBase ? { ...requestEnv, PATH: pathBase } : requestEnv;
+  const env = buildInjectedEnv(base, {
+    socketPath: "/s",
+    pid: 1,
+    paneId: "%1",
+    sessionName: "paseo-a",
+    shellReadyDelayMs: 0,
+    tmuxPath: "/usr/bin/tmux",
+  });
+  assert.equal(
+    env.PATH,
+    `/usr/bin:${daemonPath}`,
+    "tmux first, every daemon directory preserved so pi still resolves",
+  );
+  assert.equal(env.KEEP, "1");
 });
 
 test("fail-soft env clears TMUX so Amos reports its own error", () => {
@@ -538,4 +629,114 @@ test("orphan terminal still records a session-less entry", () => {
   map.rememberTerminal("a9", "t9", "pi-tmux:a9");
   assert.equal(map.get("a9")?.terminalId, "t9");
   assert.equal(map.get("a9")?.sessionName, "");
+});
+
+// ── tmux resolution (the "tmux is not on PATH" failure mode) ───────────────
+
+test("candidate list probes the documented paths in order", () => {
+  const paths = tmuxCandidatePaths("/home/cosmin");
+  assert.deepEqual(paths.slice(0, 6), [
+    "/usr/bin/tmux",
+    "/usr/local/bin/tmux",
+    "/usr/local/sbin/tmux",
+    "/opt/homebrew/bin/tmux",
+    "/opt/local/bin/tmux",
+    "/snap/bin/tmux",
+  ]);
+  assert.equal(paths[6], "/home/cosmin/.local/bin/tmux");
+  assert.equal(paths[7], "/run/current-system/sw/bin/tmux");
+  assert.equal(paths.length, TMUX_CANDIDATE_PATHS.length);
+  assert.ok(!paths.some((candidate) => candidate.includes("$HOME")));
+  assert.ok(
+    !tmuxCandidatePaths(undefined).some((candidate) => candidate.includes(".local/bin")),
+    "no HOME must skip the $HOME candidate rather than probe a literal $HOME path",
+  );
+});
+
+test("an explicit tmuxPath is authoritative: a bad override fails instead of falling back", () => {
+  const res = resolveTmuxPath(
+    {
+      configured: "/opt/tools/tmux",
+      pathLookup: "/usr/bin/tmux",
+      candidates: tmuxCandidatePaths("/home/u"),
+    },
+    (candidate) => candidate === "/usr/bin/tmux",
+  );
+  assert.equal(res.path, null);
+  assert.deepEqual(res.tried, ["tmuxPath=/opt/tools/tmux (not executable)"]);
+});
+
+test("an explicit tmuxPath wins when it is usable", () => {
+  const res = resolveTmuxPath(
+    { configured: "/opt/tools/tmux", pathLookup: "/usr/bin/tmux", candidates: [] },
+    (candidate) => candidate === "/opt/tools/tmux",
+  );
+  assert.equal(res.path, "/opt/tools/tmux");
+});
+
+test("PATH lookup wins over candidates, then candidates are probed in order", () => {
+  const candidates = tmuxCandidatePaths("/home/u");
+  const viaPath = resolveTmuxPath(
+    { configured: "", pathLookup: "/home/u/tools/tmux", candidates },
+    (candidate) => candidate === "/home/u/tools/tmux" || candidate === "/usr/bin/tmux",
+  );
+  assert.equal(viaPath.path, "/home/u/tools/tmux");
+  assert.deepEqual(viaPath.tried, ["PATH (/home/u/tools/tmux)"]);
+
+  const firstCandidate = resolveTmuxPath(
+    { configured: "", pathLookup: null, candidates },
+    (candidate) => candidate === "/usr/bin/tmux" || candidate === "/snap/bin/tmux",
+  );
+  assert.equal(firstCandidate.path, "/usr/bin/tmux", "earliest usable candidate wins");
+
+  const onlySnap = resolveTmuxPath(
+    { configured: "", pathLookup: "", candidates },
+    (candidate) => candidate === "/snap/bin/tmux",
+  );
+  assert.equal(onlySnap.path, "/snap/bin/tmux");
+});
+
+test("an unresolvable tmux reports every location it tried", () => {
+  const res = resolveTmuxPath(
+    { configured: "", pathLookup: null, candidates: tmuxCandidatePaths("/home/u") },
+    () => false,
+  );
+  assert.equal(res.path, null);
+  assert.equal(res.tried[0], "PATH (command -v tmux: not found)");
+  assert.equal(res.tried.length, 1 + TMUX_CANDIDATE_PATHS.length);
+  assert.ok(res.tried.includes("/usr/bin/tmux"));
+  assert.match(TMUX_MISSING_DETAIL, /tmuxPath/);
+});
+
+test("parsePathLookup takes the shell answer and rejects junk", () => {
+  assert.equal(parsePathLookup("/usr/bin/tmux\n"), "/usr/bin/tmux");
+  assert.equal(parsePathLookup("\n/usr/local/bin/tmux\nignored"), "/usr/local/bin/tmux");
+  assert.equal(parsePathLookup("tmux not found"), null);
+  assert.equal(parsePathLookup("./tmux"), null);
+  assert.equal(parsePathLookup(""), null);
+});
+
+test("prependToPath keeps the existing PATH intact and honours the delimiter", () => {
+  assert.equal(prependToPath("/usr/bin:/bin", "/usr/local/bin"), "/usr/local/bin:/usr/bin:/bin");
+  assert.equal(prependToPath("/usr/bin", "/usr/bin"), "/usr/bin", "no duplicate on resume/refresh");
+  assert.equal(prependToPath(undefined, "/usr/bin"), undefined, "never invent a PATH");
+  assert.equal(prependToPath("", "/usr/bin"), "/usr/bin");
+  assert.equal(prependToPath("C:\\a;C:\\b", "C:\\tmux", ";"), "C:\\tmux;C:\\a;C:\\b");
+  assert.equal(prependToPath("/usr/bin", null), "/usr/bin", "nothing resolved means PATH untouched");
+});
+
+test("binaryDirOf yields the directory that must go on PATH", () => {
+  assert.equal(binaryDirOf("/usr/bin/tmux"), "/usr/bin");
+  assert.equal(binaryDirOf("/snap/bin/tmux"), "/snap/bin");
+  assert.equal(binaryDirOf("tmux"), null);
+  assert.equal(binaryDirOf(null), null);
+});
+
+test("fail-soft env still exposes a resolved tmux directory to the agent", () => {
+  const env = buildTmuxUnavailableEnv({ PATH: "/usr/local/bin" }, {
+    shellReadyDelayMs: 0,
+    tmuxPath: "/usr/bin/tmux",
+  });
+  assert.equal(env.PATH, "/usr/bin:/usr/local/bin");
+  assert.equal(env.TMUX, "");
 });

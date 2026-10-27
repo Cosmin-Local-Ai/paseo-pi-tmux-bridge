@@ -23,6 +23,10 @@ interface Snapshot {
   sessionName: string;
   exists: boolean;
   panes: TmuxPaneDto[];
+  /** False when the daemon host has no usable tmux at all. */
+  tmuxAvailable: boolean;
+  tmuxPath: string;
+  tmuxTried: string[];
   detail?: string;
 }
 
@@ -217,15 +221,32 @@ function TmuxPanelBody({
 
   const panes = snapshot?.panes ?? [];
   const sessionName = snapshot?.sessionName ?? "";
+  // The daemon could not resolve tmux anywhere. Saying so beats an empty panel.
+  const tmuxMissing = snapshot !== null && snapshot.tmuxAvailable === false;
+  const missingText =
+    snapshot?.detail ?? "tmux not found on daemon host — install tmux or set tmuxPath";
 
   return (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Icon name="Terminal" size={18} color={theme.colors.foreground} />
+        <Icon
+          name="Terminal"
+          size={18}
+          color={tmuxMissing ? theme.colors.statusDanger : theme.colors.foreground}
+        />
         <Text style={styles.title}>
-          {snapshot ? `tmux · ${sessionName || "no session"}` : "tmux · loading…"}
+          {tmuxMissing
+            ? "tmux not found on daemon host"
+            : snapshot
+              ? `tmux · ${sessionName || "no session"}`
+              : "tmux · loading…"}
         </Text>
-        <Text style={styles.muted}>{`${panes.length} pane${panes.length === 1 ? "" : "s"}`}</Text>
+        <Text style={tmuxMissing ? styles.danger : styles.muted}>
+          {tmuxMissing
+            ? "install tmux or set tmuxPath"
+            : `${panes.length} pane${panes.length === 1 ? "" : "s"}` +
+              (snapshot?.tmuxPath ? ` · ${snapshot.tmuxPath}` : "")}
+        </Text>
       </View>
 
       <View style={styles.card}>
@@ -234,10 +255,14 @@ function TmuxPanelBody({
             accessibilityRole="button"
             onPress={handleOpenTerminal}
             style={[styles.button, styles.primary]}
-            disabled={busy === "open-terminal"}
+            disabled={busy === "open-terminal" || tmuxMissing}
           >
             <Text style={styles.primaryText}>
-              {busy === "open-terminal" ? "Opening…" : "Open attach terminal"}
+              {tmuxMissing
+                ? "tmux unavailable"
+                : busy === "open-terminal"
+                  ? "Opening…"
+                  : "Open attach terminal"}
             </Text>
           </Pressable>
           <Pressable
@@ -249,7 +274,15 @@ function TmuxPanelBody({
           </Pressable>
         </View>
         {error ? <Text style={styles.danger}>{error}</Text> : null}
-        {snapshot && !snapshot.exists ? (
+        {tmuxMissing ? (
+          <Text style={styles.danger}>
+            {missingText}
+            {snapshot && snapshot.tmuxTried.length > 0
+              ? `\nTried: ${snapshot.tmuxTried.join(", ")}`
+              : ""}
+          </Text>
+        ) : null}
+        {snapshot && !snapshot.exists && !tmuxMissing ? (
           <Text style={styles.warning}>
             {snapshot.detail ??
               `No tmux session for this agent yet. It is created when a Pi session opens.`}

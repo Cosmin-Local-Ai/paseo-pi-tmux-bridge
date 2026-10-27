@@ -105,6 +105,7 @@ Then just ask the agent to use the `subagent` tool as you would inside tmux.
 | `sessionPrefix` | `paseo-` | session = prefix + agent id |
 | `layout` | `even-horizontal` | `tmux select-layout` name |
 | `placeholderCmd` | `$SHELL -l` | keeps the host pane alive; `$SHELL` is substituted |
+| `tmuxPath` | `""` | absolute tmux override; empty = resolve it yourself (see below) |
 | `shellReadyDelayMs` | `2000` | written to `PI_SUBAGENT_SHELL_READY_DELAY_MS` |
 | `autoAttachTerminal` | `true` | open the attach terminal automatically |
 | `killOnClose` | `true` | kill the session on close/archive |
@@ -112,6 +113,41 @@ Then just ask the agent to use the `subagent` tool as you would inside tmux.
 | `autoDetectPiProviders` | `true` | treat `pi`-derived provider ids (`pi-recovery`, …) as Pi |
 | `piProviders` | `[]` | exact extra provider ids to treat as Pi |
 | `stripAmosIdentity` | `true` | drop inherited `PI_SUBAGENT_*` vars from the agent env |
+
+## "tmux not found on daemon host"
+
+A desktop daemon (AppImage, .desktop file, launchd) inherits the desktop session's `PATH`, which
+often has no tmux directory at all — `command -v tmux` then fails even though tmux is installed.
+The plugin does not rely on `PATH`. It resolves tmux once per daemon start, in this order:
+
+1. the `tmuxPath` setting, if non-empty (authoritative: if it is set and not executable the plugin
+   fails visibly instead of silently picking another tmux);
+2. `command -v tmux` through a login shell;
+3. `/usr/bin/tmux`, `/usr/local/bin/tmux`, `/usr/local/sbin/tmux`, `/opt/homebrew/bin/tmux`,
+   `/opt/local/bin/tmux`, `/snap/bin/tmux`, `$HOME/.local/bin/tmux`, `/run/current-system/sw/bin/tmux`.
+
+Each candidate is proven by running `<candidate> -V`, so a stale symlink or a non-executable file
+does not win. The absolute path is then used for every tmux call **and** for the attach terminal,
+and its directory is prepended to the agent's `PATH` — Amos runs `command -v tmux` inside the agent
+process, so without that the agent cannot split panes even when the plugin can.
+
+If nothing resolves, the failure is loud rather than silent:
+
+- the panel header reads **`tmux not found on daemon host — install tmux or set tmuxPath`**, the
+  attach button becomes `tmux unavailable`, and the panel lists every probed location;
+- `paseo plugin logs pi-tmux-bridge` prints the same sentence plus the full tried list;
+- the agent still starts, with `TMUX` empty, so Amos reports its own *"Subagents require tmux"*
+  message instead of splitting from a stale pane.
+
+Fix it by installing tmux (`apt install tmux`, `brew install tmux`) or by pointing the plugin at it:
+
+```bash
+paseo daemon config          # or the "Pi tmux bridge" settings screen
+# tmuxPath: /opt/tools/tmux
+```
+
+then `paseo plugin reload pi-tmux-bridge` (or start a new agent). The panel header shows the
+resolved path next to the pane count once it works, e.g. `2 panes · /usr/bin/tmux`.
 
 ## Layout
 
@@ -151,7 +187,15 @@ name is never accepted from the client.
 2. **`pane_current_command` usually reads `bash`, not `pi`**, for Amos subagents: Amos launches the
    child through a non-interactive `bash` script that owns the pane's foreground process group. The
    panel still shows the field, but do not treat it as an "is a subagent running here" signal.
-3. **A dead host pane breaks everything.** The placeholder pane is what `TMUX_PANE` points at, so it
+3. **A `PATH` returned by the hook replaces the daemon `PATH`, it does not extend it.** Paseo builds
+   the launch env as `{ ...daemonEnv, ...hookEnv }`, and `agent.session_open` hands the hook a sparse
+   env that normally has no `PATH` key at all. Writing `PATH=/usr/bin` there would leave the agent
+   with exactly one directory and `spawn pi` would fail with `ENOENT`. The plugin therefore extends
+   the daemon `PATH` (`pathBaseFor`) and only ever prepends the tmux directory.
+4. **Persisted settings need one host read.** The settings host never pushes an initial state, only
+   changes, so the plugin reads the stored document on first use; otherwise a saved `tmuxPath` would
+   be ignored after every restart.
+5. **A dead host pane breaks everything.** The placeholder pane is what `TMUX_PANE` points at, so it
    must stay alive for the whole agent lifetime — hence `$SHELL -l` with a `tail -f /dev/null`
    fallback rather than a short-lived command.
 

@@ -28,14 +28,20 @@ import {
   SESSION_ROWS,
   SHELL_READY_ENV_KEY,
   TMUX_BIN,
+  TMUX_MISSING_DETAIL,
+  TMUX_WHICH_ARGS,
   attachArgs,
   attachTerminalName,
   buildInjectedEnv,
   buildTmuxUnavailableEnv,
   isOwnSessionName,
+  parsePathLookup,
+  pathBaseFor,
   resolvePlaceholderCommand,
+  resolveTmuxPath,
   sessionNameFor,
   shouldHandleSessionOpen,
+  tmuxCandidatePaths,
 } from "./server/tmux.ts";
 import type { TmuxClient as TmuxClientType, TmuxRun } from "./server/tmux.ts";
 import { TmuxClient } from "./server/tmux.ts";
@@ -77,6 +83,14 @@ export default function contribute(server: PluginServerContext): () => void {
   // Providers whose interactive sessions were skipped, so the skip is logged
   // once instead of on every session_open.
   const skippedProviders = new Set<string>();
+  // Set once the host tears the plugin down: the daemon IPC channel is closed
+  // from then on, so any Paseo call would throw "Daemon client closed".
+  let stopped = false;
+  // Absolute tmux path resolved once per plugin instance (re-resolved when the
+  // settings change). `tmuxBin` is what every tmux invocation actually runs.
+  let tmuxBin = TMUX_BIN;
+  let resolution: { path: string | null; tried: string[] } | null = null;
+  let resolutionInFlight: Promise<{ path: string | null; tried: string[] }> | null = null;
   const settingsHandle = server.registerSettings(bridgeSettings);
 
   // `schema.parse({})` yields the declared defaults, so there is one source of
@@ -84,29 +98,105 @@ export default function contribute(server: PluginServerContext): () => void {
   const defaultSettings = bridgeSettings.schema.parse({}) as BridgeSettings;
   let settingsCache: BridgeSettings | null = defaultSettings;
   const unsubscribeSettings = settingsHandle.subscribe((state) => {
-    if (state.status === "ready") settingsCache = state.values;
+    if (state.status !== "ready") return;
+    if (settingsCache && settingsCache.tmuxPath !== state.values.tmuxPath) {
+      // A tmuxPath override changed: throw the cached resolution away.
+      resolution = null;
+      resolutionInFlight = null;
+    }
+    settingsCache = state.values;
   });
 
+  // The host only pushes settings on change, never as an initial state, so the
+  // first use must read the stored document. Without this, a tmuxPath saved in
+  // the app would be ignored after every daemon restart / plugin reload.
+  let settingsReadFromHost = false;
+
   async function currentSettings(): Promise<BridgeSettings> {
-    if (settingsCache) return settingsCache;
-    try {
-      const state = await settingsHandle.read();
-      if (state.status === "ready") {
-        settingsCache = state.values;
-        return state.values;
+    if (!settingsReadFromHost) {
+      settingsReadFromHost = true;
+      try {
+        const state = await settingsHandle.read();
+        if (state.status === "ready") {
+          settingsCache = state.values;
+        } else {
+          log(`settings invalid (${state.status}): ${state.error}; using defaults`);
+        }
+      } catch (error) {
+        log(`settings read failed: ${describeError(error)}; using defaults`);
       }
-      log(`settings invalid (${state.status}): ${state.error}`);
-    } catch (error) {
-      log(`settings read failed: ${describeError(error)}`);
     }
-    return defaultSettings;
+    return settingsCache ?? defaultSettings;
+  }
+
+  /**
+   * Resolve a usable tmux. A desktop daemon frequently starts with a PATH that
+   * has no tmux directory, so `tmux` by name fails even when tmux is installed;
+   * the user then sees a plugin that "does nothing". Probe order: the explicit
+   * `tmuxPath` setting, `command -v tmux`, then a fixed candidate list. The
+   * result is cached and every call - including the attach terminal's own
+   * command - uses the absolute path.
+   */
+  async function resolveTmux(signal?: AbortSignal): Promise<{ path: string | null; tried: string[] }> {
+    if (resolution) return resolution;
+    if (resolutionInFlight) return resolutionInFlight;
+    resolutionInFlight = (async () => {
+      const settings = await currentSettings();
+      const configured = typeof settings.tmuxPath === "string" ? settings.tmuxPath.trim() : "";
+      const candidates = tmuxCandidatePaths(process.env.HOME);
+      let pathLookup: string | null = null;
+      if (configured.length === 0) {
+        try {
+          const probed = await execCommand("/bin/sh", [...TMUX_WHICH_ARGS], {
+            timeout: 5000,
+            signal,
+          });
+          pathLookup = parsePathLookup(probed.stdout);
+        } catch {
+          pathLookup = null;
+        }
+      }
+      // Prove executability by running `<candidate> -V` rather than trusting that
+      // a path exists: a stale symlink or a non-executable file must not win.
+      const usable = new Set<string>();
+      const toProbe =
+        configured.length > 0 ? [configured] : [...(pathLookup ? [pathLookup] : []), ...candidates];
+      for (const candidate of toProbe) {
+        if (usable.has(candidate)) continue;
+        try {
+          await execCommand(candidate, ["-V"], { timeout: 5000, signal });
+          usable.add(candidate);
+        } catch {
+          // not here, try the next one
+        }
+      }
+      const resolved = resolveTmuxPath({ configured, pathLookup, candidates }, (c) =>
+        usable.has(c),
+      );
+      resolution = resolved;
+      if (resolved.path) tmuxBin = resolved.path;
+      log(
+        resolved.path
+          ? `tmux resolved to ${resolved.path}`
+          : `${TMUX_MISSING_DETAIL}; tried: ${resolved.tried.join(", ")}`,
+      );
+      return resolved;
+    })().finally(() => {
+      resolutionInFlight = null;
+    });
+    return resolutionInFlight;
+  }
+
+  /** True when the host's Paseo session is gone (reload, shutdown, restart). */
+  function channelGone(error: unknown): boolean {
+    return stopped || /daemon client closed|client closed|channel closed/i.test(describeError(error));
   }
 
   const runTmux =
     (signal?: AbortSignal): TmuxRun =>
     async (args) => {
       try {
-        const result = await execCommand(TMUX_BIN, args, {
+        const result = await execCommand(tmuxBin, args, {
           timeout: 15000,
           maxBuffer: 8 * 1024 * 1024,
           signal,
@@ -137,6 +227,7 @@ export default function contribute(server: PluginServerContext): () => void {
     cwd: string,
     sessionName: string,
   ): Promise<string | null> {
+    if (stopped) return null;
     const name = attachTerminalName(agentId);
     const record = bookkeeping.get(agentId);
 
@@ -149,6 +240,7 @@ export default function contribute(server: PluginServerContext): () => void {
           return record.terminalId;
         }
       } catch (error) {
+        if (channelGone(error)) return record.terminalId;
         log(`terminal list failed for ${agentId}: ${describeError(error)}`);
         return record.terminalId;
       }
@@ -162,14 +254,18 @@ export default function contribute(server: PluginServerContext): () => void {
         return byName.id;
       }
     } catch (error) {
+      if (channelGone(error)) return null;
       log(`terminal list failed for ${agentId}: ${describeError(error)}`);
     }
 
+    // The terminal process inherits the daemon environment, so it must run the
+    // resolved absolute tmux too, not `tmux` by name.
+    const resolved = await resolveTmux();
     const handle = await paseo.terminals.create({
       workspaceId,
       cwd,
       name,
-      command: TMUX_BIN,
+      command: resolved.path ?? TMUX_BIN,
       args: attachArgs(sessionName),
       size: { rows: ATTACH_TERMINAL_ROWS, cols: ATTACH_TERMINAL_COLS },
     });
@@ -187,12 +283,13 @@ export default function contribute(server: PluginServerContext): () => void {
     request: PluginSessionOpenRequest,
     sessionName: string,
   ): void {
-    if (request.workspaceId === null) return;
+    if (stopped || request.workspaceId === null) return;
     if (!bookkeeping.beginTerminal(request.agentId)) return;
     const workspaceId = request.workspaceId;
     const timer = setTimeout(() => {
       void ensureAttachTerminal(paseo, request.agentId, workspaceId, request.cwd, sessionName)
         .catch((error: unknown) => {
+          if (channelGone(error)) return;
           log(`attach terminal failed for ${request.agentId}: ${describeError(error)}`);
         })
         .finally(() => bookkeeping.endTerminal(request.agentId));
@@ -226,16 +323,32 @@ export default function contribute(server: PluginServerContext): () => void {
         return;
       }
 
+      // The hook env replaces the daemon env key-by-key, so PATH must be built
+      // on top of the daemon PATH rather than handed over as a lone directory.
+      const pathBase = pathBaseFor(request.env.PATH, process.env.PATH);
+      const baseEnv = pathBase ? { ...request.env, PATH: pathBase } : request.env;
+
       const sessionName = sessionNameFor(settings.sessionPrefix, request.agentId);
       if (!sessionName) {
         log(`refusing unsafe session name for agent ${request.agentId}`);
-        return { ...request, env: buildTmuxUnavailableEnv(request.env, settings) };
+        return { ...request, env: buildTmuxUnavailableEnv(baseEnv, settings) };
       }
 
+      const resolved = await resolveTmux(context.signal);
       const tmux = tmuxFor(context.signal);
-      if (!(await tmux.probe())) {
-        log(`tmux is not on PATH; agent ${request.agentId} gets an empty TMUX`);
-        return { ...request, env: buildTmuxUnavailableEnv(request.env, settings) };
+      if (!resolved.path) {
+        log(
+          `${TMUX_MISSING_DETAIL}; agent ${request.agentId} gets an empty TMUX. ` +
+            `Tried: ${resolved.tried.join(", ")}. Set tmuxPath to the absolute path if tmux ` +
+            `lives somewhere else on this host.`,
+        );
+        return {
+          ...request,
+          env: buildTmuxUnavailableEnv(baseEnv, {
+            ...settings,
+            tmuxPath: resolved.path,
+          }),
+        };
       }
 
       const ensured = await tmux.ensureSession({
@@ -249,7 +362,7 @@ export default function contribute(server: PluginServerContext): () => void {
 
       if (!ensured.ok) {
         log(`tmux session ${sessionName} unavailable (${ensured.stage}): ${ensured.message}`);
-        return { ...request, env: buildTmuxUnavailableEnv(request.env, settings) };
+        return { ...request, env: buildTmuxUnavailableEnv(baseEnv, settings) };
       }
 
       bookkeeping.rememberOpened({
@@ -270,13 +383,16 @@ export default function contribute(server: PluginServerContext): () => void {
 
       return {
         ...request,
-        env: buildInjectedEnv(request.env, {
+        env: buildInjectedEnv(baseEnv, {
           socketPath: ensured.handle.socketPath,
           pid: process.pid,
           paneId: ensured.handle.paneId,
           sessionName,
           shellReadyDelayMs: settings.shellReadyDelayMs,
           stripAmosIdentity: settings.stripAmosIdentity,
+          // The agent must be able to run `tmux` itself (Amos checks
+          // `command -v tmux`), so hand it the directory we resolved to.
+          tmuxPath: resolved.path,
         }),
       };
     } catch (error) {
@@ -293,6 +409,7 @@ export default function contribute(server: PluginServerContext): () => void {
     agentId: string,
     reason: "closed" | "archived",
   ): Promise<void> {
+    if (stopped) return;
     try {
       const settings = await currentSettings();
       const record = bookkeeping.get(agentId);
@@ -311,7 +428,7 @@ export default function contribute(server: PluginServerContext): () => void {
           const name = attachTerminalName(agentId);
           terminalId = listed.entries.find((entry) => entry.name === name)?.id ?? null;
         } catch (error) {
-          log(`terminal list failed for ${agentId}: ${describeError(error)}`);
+          if (!channelGone(error)) log(`terminal list failed for ${agentId}: ${describeError(error)}`);
         }
       }
 
@@ -320,7 +437,9 @@ export default function contribute(server: PluginServerContext): () => void {
           await paseo.terminals.ref(terminalId).kill();
           log(`killed attach terminal ${terminalId} for agent ${agentId}`);
         } catch (error) {
-          log(`attach terminal kill failed for ${agentId}: ${describeError(error)}`);
+          if (!channelGone(error)) {
+            log(`attach terminal kill failed for ${agentId}: ${describeError(error)}`);
+          }
         }
       }
 
@@ -337,6 +456,10 @@ export default function contribute(server: PluginServerContext): () => void {
       }
 
       const tmux = tmuxFor();
+      if (!(await resolveTmux()).path) {
+        bookkeeping.forget(agentId);
+        return;
+      }
       if (!(await tmux.sessionExists(sessionName))) {
         bookkeeping.forget(agentId);
         return;
@@ -348,7 +471,7 @@ export default function contribute(server: PluginServerContext): () => void {
 
       bookkeeping.forget(agentId);
     } catch (error) {
-      log(`cleanup failed for ${agentId}: ${describeError(error)}`);
+      if (!channelGone(error)) log(`cleanup failed for ${agentId}: ${describeError(error)}`);
     }
   }
 
@@ -362,12 +485,21 @@ export default function contribute(server: PluginServerContext): () => void {
   // ── RPC ──────────────────────────────────────────────────────────────────
 
   async function sessionFor(agentId: string): Promise<{ settings: BridgeSettings; name: string | null }> {
+    // Every RPC runs tmux through the resolved absolute path, even when no
+    // agent.session_open happened in this plugin instance.
+    void resolveTmux();
     const settings = await currentSettings();
     return { settings, name: sessionNameFor(settings.sessionPrefix, agentId) };
   }
 
   server.handle(sessionStatusRpc, async (input) => {
     const { name } = await sessionFor(input.agentId);
+    const resolved = await resolveTmux();
+    const unavailable = {
+      tmuxAvailable: Boolean(resolved.path),
+      tmuxPath: resolved.path ?? "",
+      tmuxTried: resolved.tried,
+    };
     if (!name) {
       return {
         agentId: input.agentId,
@@ -378,7 +510,22 @@ export default function contribute(server: PluginServerContext): () => void {
         terminalId: null,
         workspaceId: null,
         cwd: null,
+        ...unavailable,
         detail: "agent id is not usable as a tmux session name",
+      };
+    }
+    if (!resolved.path) {
+      return {
+        agentId: input.agentId,
+        sessionName: name,
+        managed: Boolean(bookkeeping.get(input.agentId)),
+        exists: false,
+        paneCount: 0,
+        terminalId: bookkeeping.get(input.agentId)?.terminalId ?? null,
+        workspaceId: bookkeeping.get(input.agentId)?.workspaceId ?? null,
+        cwd: bookkeeping.get(input.agentId)?.cwd ?? null,
+        ...unavailable,
+        detail: TMUX_MISSING_DETAIL,
       };
     }
     const record = bookkeeping.get(input.agentId);
@@ -393,24 +540,42 @@ export default function contribute(server: PluginServerContext): () => void {
       terminalId: record?.terminalId ?? null,
       workspaceId: record?.workspaceId ?? null,
       cwd: record?.cwd ?? null,
+      ...unavailable,
     };
   });
 
   server.handle(listPanesRpc, async (input) => {
     const { name } = await sessionFor(input.agentId);
+    const resolved = await resolveTmux();
+    const unavailable = {
+      tmuxAvailable: Boolean(resolved.path),
+      tmuxPath: resolved.path ?? "",
+      tmuxTried: resolved.tried,
+    };
     if (!name) {
       return {
         agentId: input.agentId,
         sessionName: "",
         exists: false,
         panes: [],
+        ...unavailable,
         detail: "agent id is not usable as a tmux session name",
+      };
+    }
+    if (!resolved.path) {
+      return {
+        agentId: input.agentId,
+        sessionName: name,
+        exists: false,
+        panes: [],
+        ...unavailable,
+        detail: TMUX_MISSING_DETAIL,
       };
     }
     const tmux = tmuxFor();
     const exists = await tmux.sessionExists(name);
     const panes = exists ? await tmux.listPanes(name) : [];
-    return { agentId: input.agentId, sessionName: name, exists, panes };
+    return { agentId: input.agentId, sessionName: name, exists, panes, ...unavailable };
   });
 
   server.handle(capturePaneRpc, async (input) => {
@@ -498,6 +663,10 @@ export default function contribute(server: PluginServerContext): () => void {
   );
 
   return () => {
+    // The daemon IPC channel closes with the plugin: stop touching Paseo after
+    // this point, otherwise cleanup and pending attach terminals log
+    // "Daemon client closed" noise on every reload/shutdown.
+    stopped = true;
     unsubscribeSettings();
     offClosed();
     offArchived();

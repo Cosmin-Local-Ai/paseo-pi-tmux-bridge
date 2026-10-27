@@ -24,6 +24,17 @@ export const bridgeSettings = defineSettings({
       .regex(/^[a-z][a-z0-9-]{0,31}$/, "Lowercase tmux layout name")
       .default("even-horizontal"),
     placeholderCmd: z.string().trim().min(1).max(200).default("$SHELL -l"),
+    /**
+     * Absolute path to the tmux binary on the daemon host. Empty means "find it
+     * yourself": `command -v tmux` first, then a fixed candidate list. Set this
+     * when tmux lives somewhere the daemon cannot see — a desktop daemon often
+     * starts with a PATH that contains no tmux directory at all.
+     */
+    tmuxPath: z
+      .string()
+      .trim()
+      .regex(/^(?:|\/.{0,299})$/, "Use an absolute path such as /usr/bin/tmux")
+      .default(""),
     shellReadyDelayMs: z.number().int().min(0).max(60000).default(2000),
     autoAttachTerminal: z.boolean().default(true),
     /**
@@ -93,6 +104,12 @@ export const sessionStatusRpc = defineRpc({
     terminalId: z.string().nullable(),
     workspaceId: z.string().nullable(),
     cwd: z.string().nullable(),
+    /** Whether the daemon host resolved a usable tmux at all. */
+    tmuxAvailable: z.boolean(),
+    /** Absolute path the plugin resolved; empty when nothing resolved. */
+    tmuxPath: z.string(),
+    /** Every location probed, so a failure names what was tried. */
+    tmuxTried: z.array(z.string()),
     detail: z.string().optional(),
   }),
 });
@@ -105,6 +122,9 @@ export const listPanesRpc = defineRpc({
     sessionName: z.string(),
     exists: z.boolean(),
     panes: z.array(paneDtoSchema),
+    tmuxAvailable: z.boolean(),
+    tmuxPath: z.string(),
+    tmuxTried: z.array(z.string()),
     detail: z.string().optional(),
   }),
 });

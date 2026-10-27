@@ -711,3 +711,232 @@ $ tmux ls | grep -c '^paseo-'
   bundle path.
 - Two concurrent agents **after** this pass's changes (proven in the previous pass, unchanged code
   paths).
+
+---
+
+# 2026-10-27 (third pass) — `tmux is not on PATH`: absolute resolution, PATH injection, loud failure
+
+Everything below ran against scratch homes (`/tmp/paseo-verify-home`, `/tmp/paseo-notmux-home`), never
+`/home/cosmin/.paseo` (read-only `grep` only). The Paseo checkout was not built in or modified. No web
+app rebuild: the previously built bundle at `/tmp/paseo-build/.../web-ui` was reused. Screenshots are
+in `evidence/`, each verified with `details.artifactVerification` and inspected.
+
+## 1. The user's evidence (their own `~/.paseo/daemon.log`, read-only)
+
+The fixed build is installed and the provider fix works, but every agent hits the fail-soft path:
+
+```text
+$ grep -c "tmux is not on PATH" ~/.paseo/daemon.log
+15
+$ grep -o "terminal list failed for [a-z0-9-]*: Daemon client closed" ~/.paseo/daemon.log
+terminal list failed for e30928dc-091c-4671-a5d8-9c333ff69f4f: Daemon client closed
+```
+
+`tmux is not on PATH` was, at that point, a one-line log entry and an empty panel: nothing told the
+user what was tried or what to do, and Amos inside the agent had no tmux either.
+
+## 2. Absolute tmux resolution (server)
+
+`server/tmux.ts` gained `TMUX_CANDIDATE_PATHS`, `tmuxCandidatePaths()`, `TMUX_WHICH_ARGS`,
+`parsePathLookup()`, `resolveTmuxPath()` and `binaryDirOf()`. `index.server.ts` resolves once per
+plugin instance and caches, re-resolving when `tmuxPath` changes. Probe order:
+
+1. `tmuxPath` setting (new, absolute path, default `""`). It is **authoritative**: a set-but-bad
+   override fails visibly instead of silently falling back to another tmux.
+2. `command -v tmux` via `/bin/sh -lc`.
+3. `/usr/bin`, `/usr/local/bin`, `/usr/local/sbin`, `/opt/homebrew/bin`, `/opt/local/bin`,
+   `/snap/bin`, `$HOME/.local/bin`, `/run/current-system/sw/bin`.
+
+Every candidate is proven by executing `<candidate> -V`, so a stale symlink or non-executable file
+cannot win. The resolved path is used for every tmux call and as the attach terminal's `command`
+(the terminal also inherits the daemon environment, so `tmux` by name would have failed there too).
+
+## 3. `PATH` injection — and the trap that came with it
+
+Amos gates on `command -v tmux` **inside the agent process**, so the agent needs the resolved
+directory on its `PATH`. `buildInjectedEnv`/`buildTmuxUnavailableEnv` now take `tmuxPath` and prepend
+`binaryDirOf(tmuxPath)` using `path.delimiter`-style joining (`PATH_DELIMITER`, `prependToPath`),
+de-duplicating on resume/refresh.
+
+The first implementation wrote `PATH = tmuxDir` when the hook env had no `PATH`, and the live run
+caught the consequence:
+
+```text
+$ paseo agent reload 661d0635-…
+Error: spawn pi ENOENT requestType=refresh_agent_request code=agent_refresh_failed
+```
+
+because Paseo composes the launch env as `{ ...daemonEnv, ...hookEnv }`
+(`packages/server/src/server/agent/provider-launch-config.ts:252`,
+`createExternalProcessEnv(spec.baseEnv ?? process.env, spec.envOverlay)`), so a hook `PATH`
+**replaces** the daemon `PATH`. `agent.session_open` hands the hook a sparse env with no `PATH` key,
+so the injection now bases itself on the daemon `PATH` (`pathBaseFor`) and never emits a lone
+directory. Unit-tested.
+
+## 4. The failure is now loud
+
+- `session-status` and `list-panes` return `tmuxAvailable`, `tmuxPath` and `tmuxTried`; when
+  unavailable they return `detail: TMUX_MISSING_DETAIL`.
+- Panel header: **`tmux not found on daemon host`** + `install tmux or set tmuxPath`, the attach
+  button becomes `tmux unavailable` (disabled), and a red block repeats the sentence with the full
+  tried list. When tmux *is* resolved, the header shows it: `2 panes · /usr/bin/tmux`.
+- Log line names every probe:
+
+  ```text
+  [pi-tmux-bridge] tmux not found on daemon host — install tmux or set tmuxPath; tried: PATH (command -v tmux: not found), /usr/bin/tmux, /usr/local/bin/tmux, /usr/local/sbin/tmux, /opt/homebrew/bin/tmux, /opt/local/bin/tmux, /snap/bin/tmux, /home/agent/.local/bin/tmux, /run/current-system/sw/bin/tmux
+  ```
+
+## 5. `Daemon client closed` noise
+
+`contribute()`'s teardown now sets `stopped = true`; `handleAgentGone`, `ensureAttachTerminal`,
+`scheduleAttachTerminal` and their catches skip work / suppress logging through `channelGone()`, and
+the cleanup path re-derives names instead of touching a dead channel. After a plugin reload with a
+live agent, both scratch logs contain zero `Daemon client closed` and zero `terminal list failed`
+lines (the user's log has one of each from the unfixed build).
+
+## 6. Another real defect found while testing: saved settings were never read
+
+`settingsCache` was initialised to the declared defaults and `currentSettings()` returned it
+unconditionally, while the host only *pushes settings on change*
+(`packages/server/src/server/plugins/settings/index.ts` — `subscribe` never delivers an initial
+state). So a `tmuxPath` saved in the app was ignored after every restart/reload. `currentSettings()`
+now performs exactly one host read on first use.
+
+Settings live at `<home>/plugin-settings/<pluginId>/<settingsId>.json` as an **envelope**,
+`{"version": 1, "values": {...}}`; a bare values object is rejected (`Invalid input; using defaults`).
+
+## 7. Scenario A — daemon whose `PATH` cannot resolve tmux (the user's condition)
+
+Built a faithful reproduction without touching the system: `/tmp/no-tmux-bin` holds symlinks to every
+`/usr/bin` binary **except tmux**, and the daemon was started with
+`PATH=/tmp/no-tmux-bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/sbin:/usr/local/share/npm-global/bin`
+(no `/usr/bin`) and `TMUX`/`TMUX_PANE` unset.
+
+```text
+control:  env -i PATH=<daemon PATH> sh -c 'command -v tmux'   → (nothing; daemon PATH alone cannot resolve tmux)
+
+plugin log:
+  [pi-tmux-bridge] tmux resolved to /usr/bin/tmux
+  [pi-tmux-bridge] agent df3d3456-… (create) -> tmux paseo-df3d3456-… pane %12 (created)
+  [pi-tmux-bridge] opened attach terminal 5fbaceda-… for agent df3d3456-…
+
+/proc/19702/environ (the pi process Paseo spawned):
+  TMUX=/tmp/tmux-1000/default,19594,0
+  TMUX_PANE=%12
+  PASEO_TMUX_SESSION=paseo-df3d3456-…
+  PATH=/usr/bin:/home/cosmin/paseo-pi-subagent-fix/node_modules/.bin:…:/tmp/no-tmux-bin:…
+  env -i PATH=<that PATH> sh -c 'command -v tmux' → /usr/bin/tmux (tmux 3.6)
+```
+
+The `/usr/bin` entry only exists because the plugin injected it: the daemon's own `PATH` has no
+directory that contains tmux (control above). A real Amos `subagent` call then split the session:
+
+```text
+%12 idx=0 active=1 w=110 h=49 cmd=bash     (placeholder / main)
+%13 idx=1 active=0 w=109 h=49 cmd=bash     (worker)
+```
+
+* `evidence/16-attach-terminal-two-panes-no-tmux-on-daemon-path.png` — the auto `tmux attach` tab with
+  two panes side by side: main shell left, the `[worker]` Pi TUI on the right running
+  `$ sleep 180 && echo BRIDGE_UI_OK (timeout 300s)`, green tmux status bar at the bottom.
+* `evidence/17-panel-two-panes-resolved-tmux-path.png` — panel header `tmux · paseo-df3d3456-…` with
+  **`2 panes · /usr/bin/tmux`**, both pane cards side by side with live captures (worker text visible).
+
+## 8. Scenario B — tmux genuinely absent on the daemon host
+
+Ran the daemon in a private mount namespace with tmux hidden, then dropped to uid 1000 so nothing on
+the host is owned by root:
+
+```text
+$ sudo -n unshare -m /tmp/start-notmux-daemon.sh
+in-namespace tmux: NONE
+Started: PID 23084, listening on 127.0.0.1:6768
+$ ls -l /proc/23084/root/usr/bin/tmux
+crw-rw-rw- 1 root root 1, 3 … /proc/23084/root/usr/bin/tmux     # /dev/null over the real binary
+```
+
+Separate home (`/tmp/paseo-notmux-home`, port 6768, same web UI dist), plugin installed as a directory
+source, agent via provider `pi-recovery`:
+
+```text
+[pi-tmux-bridge] tmux not found on daemon host — install tmux or set tmuxPath; tried: PATH (command -v tmux: not found), /usr/bin/tmux, /usr/local/bin/tmux, /usr/local/sbin/tmux, /opt/homebrew/bin/tmux, /opt/local/bin/tmux, /snap/bin/tmux, /home/agent/.local/bin/tmux, /run/current-system/sw/bin/tmux
+[pi-tmux-bridge] tmux not found on daemon host — install tmux or set tmuxPath; agent 9b2f7b7b-… gets an empty TMUX. … Set tmuxPath to the absolute path if tmux lives somewhere else on this host.
+
+/proc/22033/environ:  TMUX=   TMUX_PANE=   PASEO_TMUX_SESSION=
+```
+
+* `evidence/18-panel-tmux-not-found-diagnostic.png` — the panel with **no** blank state: red header
+  `tmux not found on daemon host` + `install tmux or set tmuxPath`, disabled `tmux unavailable`
+  button, and the full `Tried: …` list rendered in the UI.
+* `evidence/19-chat-amos-tmux-error-no-tmux-host.png` — what the user actually sees in chat when the
+  agent tries a subagent: *"Subagents require tmux. Start pi inside tmux (`tmux new -A -s pi 'pi'`)"*,
+  with no subagent spawned. This is the "doesn't do anything" symptom, now paired with an explicit
+  panel diagnosis instead of an empty pane list.
+
+## 9. Scenario C — `tmuxPath` rescues a host where tmux is nowhere on `PATH`
+
+Inside the same tmux-less namespace, tmux was copied to a location that is neither on `PATH` nor in
+the candidate list, and declared in the settings document:
+
+```text
+$ cp /usr/bin/tmux /tmp/opt-tmux/tmux
+$ cat /tmp/paseo-notmux-home/plugin-settings/pi-tmux-bridge/pi-tmux-bridge.json
+{ "version": 1, "values": { "tmuxPath": "/tmp/opt-tmux/tmux" } }
+
+[pi-tmux-bridge] tmux resolved to /tmp/opt-tmux/tmux
+[pi-tmux-bridge] agent a6f78c55-… (create) -> tmux paseo-a6f78c55-… pane %14 (created)
+[pi-tmux-bridge] opened attach terminal 7b23917e-… for agent a6f78c55-…
+
+/proc environ: TMUX=/tmp/tmux-1000/default,23641,0  TMUX_PANE=%14  PASEO_TMUX_SESSION=paseo-a6f78c55-…
+               PATH=/tmp/opt-tmux:/home/cosmin/…     command -v tmux → /tmp/opt-tmux/tmux
+```
+
+* `evidence/20-panel-tmuxpath-override-session.png` — panel header
+  `tmux · paseo-a6f78c55-…` with **`1 pane · /tmp/opt-tmux/tmux`** and a live captured pane; the
+  `tmux attach -t paseo-a6f78c55…` tab also opened on its own.
+
+## 10. Tests / compile status
+
+```text
+$ node --test tests/unit.test.ts
+ℹ tests 42
+ℹ pass 42
+ℹ fail 0
+
+$ CHECKOUT=/home/cosmin/paseo-pi-subagent-fix npx --prefix "$CHECKOUT" tsx tests/compile-check.mjs
+compile-check: PASS   (contributionIdsChecked: 7, badContributionIds: [])
+
+$ npx tsc --noEmit -p tsconfig.json      # exit 0
+```
+
+New unit tests cover: candidate order and `$HOME` substitution (and that a missing `HOME` skips the
+`$HOME` candidate rather than probing a literal `$HOME`), the authoritative `tmuxPath` override with
+no silent fallback, PATH-lookup-before-candidates ordering, the full `tried` list on failure,
+`parsePathLookup` junk rejection, `prependToPath` (prepend, de-dupe, empty, `;` delimiter, never
+inventing a PATH), `binaryDirOf`, `pathBaseFor`, PATH injection through `buildInjectedEnv` including
+"keeps every daemon directory so `pi` still resolves", and the fail-soft env.
+
+## 11. Cleanup and checkout integrity
+
+Both scratch daemons stopped (`daemon stop`), the namespaced daemon's tmux sessions killed,
+`/tmp/no-tmux-bin`, `/tmp/opt-tmux`, `/tmp/start-notmux-daemon.sh` and the scratch homes removed.
+`tmux ls` shows no `paseo-*` session. The checkout is untouched:
+
+```text
+$ cd /home/cosmin/paseo-pi-subagent-fix && git status --short | head -3; git stash list; git log --oneline -1
+stash@{0}: On (no branch): chatgpt-attempt: in-daemon pi-interactive-subagents adapter + registry registration
+d294115 chore(release): cut 0.13.2
+```
+
+`/home/cosmin/.paseo` was only ever read with `grep`.
+
+## 12. Still not proven
+
+- The user's exact desktop environment (AppImage daemon, their `PATH`, their tmux location). Scenario
+  A reproduces the failure mode and the fix, not their machine.
+- Windows (`PATH_DELIMITER` is chosen from `process.platform`, and the candidate list is POSIX-only).
+- Editing settings through the app UI: the settings *document* was written directly at
+  `<home>/plugin-settings/pi-tmux-bridge/pi-tmux-bridge.json`, which is the same store the UI writes;
+  the in-UI round-trip itself was not exercised.
+- A macOS/Homebrew tmux install (`/opt/homebrew/bin/tmux` is in the list but was not exercised).
+- Concurrent agents under the new resolution code (unchanged naming/locking paths, proven earlier).
