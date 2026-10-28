@@ -62,6 +62,9 @@ import type { PrefixValues, TmuxRunResult } from "./server/tmux.ts";
 import type { TmuxClient as TmuxClientType, TmuxRun } from "./server/tmux.ts";
 import { TmuxClient } from "./server/tmux.ts";
 
+/** Deadline for a single tmux exec through the namespace prefix. */
+const TMUX_EXEC_TIMEOUT_MS = 8000;
+
 /**
  * pi-tmux-bridge
  *
@@ -428,7 +431,10 @@ export default function contribute(server: PluginServerContext): () => void {
       );
       try {
         const result = await execCommand(invocation.command, invocation.args, {
-          timeout: 15000,
+          // A tmux call that needs 8s through the sandbox prefix is already
+          // pathological, and the hook that awaits several of them must stay well
+          // inside Paseo's 30s plugin-hook budget.
+          timeout: TMUX_EXEC_TIMEOUT_MS,
           maxBuffer: 8 * 1024 * 1024,
           signal,
         });
@@ -452,6 +458,31 @@ export default function contribute(server: PluginServerContext): () => void {
     values: PrefixValues,
     signal?: AbortSignal,
   ): TmuxClientType => new TmuxClient(runTmuxFor(target, values, signal));
+
+  /**
+   * Paseo cancels a plugin hook at 30s (`plugins/runtime.ts: REQUEST_TIMEOUT_MS`)
+   * and a failed `agent.session_open` fails the whole agent open, so the tmux
+   * handoff gets a deliberately smaller budget than the hook that awaits it.
+   */
+  const HOOK_HANDOFF_BUDGET_MS = 12000;
+
+  /** Resolve `null` instead of letting a slow exec outrun a caller's deadline. */
+  function withinBudget<T>(work: Promise<T>, ms: number): Promise<T | null> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), ms);
+      if (typeof timer.unref === "function") timer.unref();
+      work.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(null);
+        },
+      );
+    });
+  }
 
   // ── attach terminal ───────────────────────────────────────────────────────
 
@@ -650,14 +681,35 @@ export default function contribute(server: PluginServerContext): () => void {
         };
       }
 
-      const ensured = await tmux.ensureSession({
-        name: sessionName,
-        cwd: request.cwd,
-        cols: SESSION_COLS,
-        rows: SESSION_ROWS,
-        placeholder: resolvePlaceholderCommand(settings.placeholderCmd, process.env),
-        layout: settings.layout || AMOS_LAYOUT,
-      });
+      const ensured = await withinBudget(
+        tmux.ensureSession({
+          name: sessionName,
+          cwd: request.cwd,
+          cols: SESSION_COLS,
+          rows: SESSION_ROWS,
+          placeholder: resolvePlaceholderCommand(settings.placeholderCmd, process.env),
+          layout: settings.layout || AMOS_LAYOUT,
+        }),
+        HOOK_HANDOFF_BUDGET_MS,
+      );
+
+      if (ensured === null) {
+        // The sandbox is too busy to answer tmux inside the budget. Launching the
+        // agent anyway is the only acceptable outcome: a failed session_open leaves
+        // the agent unopenable, which looks like an app that never finishes loading.
+        log(
+          `tmux handoff for ${sessionName} exceeded ${HOOK_HANDOFF_BUDGET_MS}ms; launching the agent `
+            + `without a pane. Amos subagents stay blocked until the sandbox answers tmux.`,
+        );
+        return {
+          ...request,
+          env: buildTmuxUnavailableEnv(baseEnv, {
+            ...settings,
+            tmuxPath: target.path,
+            injectTmuxDir: false,
+          }),
+        };
+      }
 
       if (!ensured.ok) {
         log(`tmux session ${sessionName} unavailable (${ensured.stage}): ${ensured.message}`);

@@ -1100,6 +1100,46 @@ check derives the expected RPC names from `shared/contracts.ts`, so a one-sided 
 
 tests 86 pass (64 unit, 22 ansi) · Paseo plugin compiler PASS · `tsc --noEmit` clean.
 
+## 7. The hook was the timeout: six execs inside `agent.session_open`
+
+The user-visible failure was not the panel:
+
+```
+Plugin pi-tmux-bridge before agent.session_open failed: Plugin RPC timed out: pi-tmux-bridge.hook
+Failed to handle fetch_agent_timeline_request
+```
+
+`ensureSession` issued six sequential tmux calls - `has-session`, `new-session`, `select-layout`,
+`display-message` for pane id, another for socket path, another for server pid - each with a 15s exec
+timeout, all through the sandbox prefix. Paseo cancels a plugin hook at 30s and a failed
+`agent.session_open` fails the whole agent open, so a busy container turned into an app that never
+finished loading.
+
+One tmux call answers existence *and* returns the handoff:
+
+```bash
+$ tmux display-message -p -t paseo-a68262c4 '#{pane_id}|#{socket_path}|#{server_pid}'
+%18|/tmp/tmux-1000/default|
+$ tmux new-session -d -P -F '#{pane_id}|#{socket_path}|#{server_pid}' -s h1 'sleep 20'
+%0|/tmp/tmux-1000/hand|
+```
+
+Note the empty third field: `server_pid` does not expand on this tmux 3.6 build. It is informational -
+Amos gates on `TMUX` being set and tmux connects through the socket half.
+
+Measured against the real tmux 3.6 in the container, driving `TmuxClient.ensureSession` directly:
+
+```
+create: true {"paneId":"%0","socketPath":"/tmp/tmux-1000/hcheck","created":true}  execs: 3
+reuse : true {"paneId":"%0","socketPath":"/tmp/tmux-1000/hcheck","created":false} execs: 1
+never killed: true
+```
+
+Plus two safety layers, because exec count alone cannot guarantee the budget: per-tmux-exec timeout
+15s → 8s, and the handoff is wrapped in a 12s budget. Past that the agent **launches without a pane**
+(`TMUX=""`, Amos subagents blocked) rather than failing the open - a degraded agent is recoverable, a
+stranded one is not.
+
 ## Still not proven
 
 Real `sbx`/containerd sandbox (the harness is `unshare`+`nsenter`, not their runtime); `agent.closed`

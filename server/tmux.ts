@@ -437,6 +437,36 @@ export function hasSessionCmd(name: string): string[] {
   return ["has-session", "-t", name];
 }
 
+/**
+ * Everything the agent env needs, in one tmux call. `server_pid` expands empty on
+ * this tmux 3.6 build, which is fine: Amos only gates on `TMUX` being set and tmux
+ * connects through the socket path, so the pid half is informational.
+ */
+export const HANDOFF_FORMAT = "#{pane_id}|#{socket_path}|#{server_pid}";
+
+export function displayHandoffCmd(name: string): string[] {
+  return ["display-message", "-p", "-t", name, HANDOFF_FORMAT];
+}
+
+/** `pane_id|socket_path|server_pid` from `display-message -p` or `new-session -P -F`. */
+export function parseHandoff(stdout: string): {
+  paneId: string | null;
+  socketPath: string | null;
+  serverPid: number | null;
+} {
+  const line = String(stdout ?? "")
+    .split("\n")
+    .map((row) => row.trim())
+    .find((row) => row.length > 0);
+  if (!line) return { paneId: null, socketPath: null, serverPid: null };
+  const [pane = "", socket = "", pid = ""] = line.split("|");
+  return {
+    paneId: isSafePaneId(pane) ? pane : null,
+    socketPath: socket.startsWith("/") ? socket : null,
+    serverPid: /^[0-9]{1,10}$/.test(pid) ? Number(pid) : null,
+  };
+}
+
 export function newSessionCmd(options: {
   name: string;
   cwd: string;
@@ -447,6 +477,9 @@ export function newSessionCmd(options: {
   return [
     "new-session",
     "-d",
+    "-P",
+    "-F",
+    HANDOFF_FORMAT,
     "-s",
     options.name,
     "-c",
@@ -872,37 +905,80 @@ export class TmuxClient {
     if (!isSafeSessionName(options.name)) {
       return { ok: false, stage: "name", message: `unsafe session name: ${options.name}` };
     }
-    let created = false;
-    const existing = await this.run(hasSessionCmd(options.name));
-    if (!existing.ok) {
-      const primary = await this.run(
+    /**
+     * One call answers "does this session exist" *and* returns the handoff when it
+     * does. The previous sequence spent six sequential execs (has-session, possibly
+     * new-session, select-layout, display pane id, socket path, server pid); at 15s
+     * per exec through a sandbox prefix that could outlast Paseo's 30s plugin-hook
+     * budget and fail `agent.session_open` outright, which strands the agent.
+     */
+    const existing = await this.run(displayHandoffCmd(options.name));
+    if (existing.ok) {
+      const reused = parseHandoff(existing.stdout);
+      if (!reused.paneId || !reused.socketPath) {
+        return {
+          ok: false,
+          // One call carries both halves, but it can still say which one is missing.
+          stage: reused.paneId ? "socket" : "pane-id",
+          message: existing.stderr || `session ${options.name} reported no pane id or socket`,
+        };
+      }
+      return {
+        ok: true,
+        handle: {
+          paneId: reused.paneId,
+          socketPath: reused.socketPath,
+          serverPid: reused.serverPid,
+          created: false,
+        },
+      };
+    }
+
+    const primary = await this.run(
+      newSessionCmd({
+        name: options.name,
+        cwd: options.cwd,
+        cols: options.cols,
+        rows: options.rows,
+        placeholder: options.placeholder,
+      }),
+    );
+    let created = primary.ok;
+    let body = primary;
+    if (!created) {
+      const fallback = await this.run(
         newSessionCmd({
           name: options.name,
           cwd: options.cwd,
           cols: options.cols,
           rows: options.rows,
-          placeholder: options.placeholder,
+          placeholder: FALLBACK_PLACEHOLDER_CMD,
         }),
       );
-      if (!primary.ok) {
-        const fallback = await this.run(
-          newSessionCmd({
-            name: options.name,
-            cwd: options.cwd,
-            cols: options.cols,
-            rows: options.rows,
-            placeholder: FALLBACK_PLACEHOLDER_CMD,
-          }),
-        );
-        if (!fallback.ok) {
+      // A duplicate-session failure usually means a concurrent open for the same
+      // agent won the race; its session is just as good as ours.
+      if (!fallback.ok) {
+        const raced = await this.run(displayHandoffCmd(options.name));
+        const winner = parseHandoff(raced.stdout);
+        if (winner.paneId && winner.socketPath) {
           return {
-            ok: false,
-            stage: "new-session",
-            message: `${primary.stderr || primary.stdout || fallback.stderr || "new-session failed"}`,
+            ok: true,
+            handle: {
+              paneId: winner.paneId,
+              socketPath: winner.socketPath,
+              serverPid: winner.serverPid,
+              created: false,
+            },
           };
         }
+        return {
+          ok: false,
+          stage: "new-session",
+          message: `${primary.stderr || primary.stdout || fallback.stderr || "new-session failed"}`,
+        };
       }
       created = true;
+      body = fallback;
     }
 
     if (isSafeLayout(options.layout)) {
@@ -910,23 +986,31 @@ export class TmuxClient {
       await this.run(selectLayoutCmd(options.name, options.layout));
     }
 
-    const paneRes = await this.run(displayPaneIdCmd(options.name));
-    const paneId = parsePaneId(paneRes.stdout);
-    if (!paneId) {
-      return { ok: false, stage: "pane-id", message: paneRes.stderr || "no pane id for session" };
+    // `new-session -P -F` already printed the handoff; fall back to one query only
+    // when that output was unusable (older tmux, empty stdout).
+    let handoff = parseHandoff(body.stdout);
+    if (!handoff.paneId || !handoff.socketPath) {
+      handoff = parseHandoff((await this.run(displayHandoffCmd(options.name))).stdout);
+    }
+    if (!handoff.paneId || !handoff.socketPath) {
+      return {
+        ok: false,
+        stage: handoff.paneId ? "socket" : "pane-id",
+        message: `no pane id or socket for ${options.name}`,
+      };
     }
 
-    const socketRes = await this.run(displaySocketPathCmd());
-    const socketPath = parseSocketPath(socketRes.stdout);
-    if (!socketPath) {
-      return { ok: false, stage: "socket", message: socketRes.stderr || "no tmux socket path" };
-    }
-
-    // Best effort: a namespace may hide the pid, and Amos does not validate it.
-    const pidRes = await this.run(displayServerPidCmd());
-    const serverPid = parseServerPid(pidRes.stdout);
-
-    return { ok: true, handle: { paneId, socketPath, serverPid, created } };
+    return {
+      ok: true,
+      handle: {
+        paneId: handoff.paneId,
+        socketPath: handoff.socketPath,
+        // Best effort: this tmux build leaves server_pid empty, and Amos does not
+        // validate the pid half of TMUX.
+        serverPid: handoff.serverPid,
+        created,
+      },
+    };
   }
 
   async sessionExists(name: string): Promise<boolean> {

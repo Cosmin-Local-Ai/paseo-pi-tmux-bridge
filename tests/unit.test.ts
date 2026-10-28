@@ -13,6 +13,7 @@ import {
   DEFAULT_SESSION_PREFIX,
   DEFAULT_SHELL_READY_DELAY_MS,
   FALLBACK_PLACEHOLDER_CMD,
+  HANDOFF_FORMAT,
   SESSION_ENV_KEY,
   SHELL_READY_ENV_KEY,
   TmuxClient,
@@ -23,6 +24,7 @@ import {
   buildInjectedEnv,
   buildTmuxUnavailableEnv,
   capturePaneCmd,
+  displayHandoffCmd,
   displayPaneIdCmd,
   displayServerPidCmd,
   displaySocketPathCmd,
@@ -37,6 +39,7 @@ import {
   killSessionCmd,
   listPanesCmd,
   newSessionCmd,
+  parseHandoff,
   parsePaneId,
   parsePaneRows,
   parsePathLookup,
@@ -346,10 +349,33 @@ test("resolvePlaceholderCommand substitutes SHELL and falls back", () => {
 
 test("command builders produce the spec'd argv", () => {
   assert.deepEqual(hasSessionCmd("paseo-a"), ["has-session", "-t", "paseo-a"]);
+  // -P -F makes creation itself return the handoff: no follow-up query.
   assert.deepEqual(
     newSessionCmd({ name: "paseo-a", cwd: "/w", cols: 220, rows: 60, placeholder: "/bin/bash -l" }),
-    ["new-session", "-d", "-s", "paseo-a", "-c", "/w", "-x", "220", "-y", "60", "/bin/bash -l"],
+    [
+      "new-session",
+      "-d",
+      "-P",
+      "-F",
+      HANDOFF_FORMAT,
+      "-s",
+      "paseo-a",
+      "-c",
+      "/w",
+      "-x",
+      "220",
+      "-y",
+      "60",
+      "/bin/bash -l",
+    ],
   );
+  assert.deepEqual(displayHandoffCmd("paseo-a"), [
+    "display-message",
+    "-p",
+    "-t",
+    "paseo-a",
+    HANDOFF_FORMAT,
+  ]);
   assert.deepEqual(selectLayoutCmd("paseo-a", "even-horizontal"), [
     "select-layout",
     "-t",
@@ -501,11 +527,12 @@ function fakeTmux(script: Array<{ match: string[]; result: TmuxRunResult }>) {
 const ok = (stdout = ""): TmuxRunResult => ({ ok: true, stdout, stderr: "" });
 const fail = (stderr = "no session"): TmuxRunResult => ({ ok: false, stdout: "", stderr });
 
+const HANDOFF = ["display-message", "-p", "-t", "paseo-a", HANDOFF_FORMAT];
+
 test("ensureSession creates the session when it is missing", async () => {
   const { run, calls } = fakeTmux([
-    { match: ["has-session"], result: fail() },
-    { match: ["display-message", "-p", "-t", "paseo-a", "#{pane_id}"], result: ok("%42\n") },
-    { match: ["display-message", "-p", "#{socket_path}"], result: ok("/tmp/tmux-1000/default\n") },
+    { match: HANDOFF, result: fail("can't find session: paseo-a") },
+    { match: ["new-session"], result: ok("%42|/tmp/tmux-1000/default|24601\n") },
   ]);
   const client = new TmuxClient(run);
   const result = await client.ensureSession({
@@ -520,11 +547,15 @@ test("ensureSession creates the session when it is missing", async () => {
   if (!result.ok) return;
   assert.equal(result.handle.paneId, "%42");
   assert.equal(result.handle.socketPath, "/tmp/tmux-1000/default");
+  assert.equal(result.handle.serverPid, 24601);
   assert.equal(result.handle.created, true);
-  assert.deepEqual(calls[0], ["has-session", "-t", "paseo-a"]);
+  assert.deepEqual(calls[0], HANDOFF);
   assert.deepEqual(calls[1], [
     "new-session",
     "-d",
+    "-P",
+    "-F",
+    HANDOFF_FORMAT,
     "-s",
     "paseo-a",
     "-c",
@@ -536,13 +567,14 @@ test("ensureSession creates the session when it is missing", async () => {
     "/bin/bash -l",
   ]);
   assert.deepEqual(calls[2], ["select-layout", "-t", "paseo-a", "even-horizontal"]);
+  // Probe + create + layout. The old sequence spent six execs here, which at 15s
+  // each could outrun Paseo's 30s plugin-hook budget and fail agent.session_open.
+  assert.equal(calls.length, 3);
 });
 
 test("ensureSession reuses an existing session and never kills it", async () => {
   const { run, calls } = fakeTmux([
-    { match: ["has-session"], result: ok() },
-    { match: ["display-message", "-p", "-t", "paseo-a", "#{pane_id}"], result: ok("%77\n") },
-    { match: ["display-message", "-p", "#{socket_path}"], result: ok("/sock\n") },
+    { match: HANDOFF, result: ok("%77|/sock|123\n") },
   ]);
   const result = await new TmuxClient(run).ensureSession({
     name: "paseo-a",
@@ -558,14 +590,15 @@ test("ensureSession reuses an existing session and never kills it", async () => 
   assert.equal(result.handle.paneId, "%77", "pane id must be re-read");
   assert.equal(calls.some((args) => args[0] === "new-session"), false, "must not re-create");
   assert.equal(calls.some((args) => args[0] === "kill-session"), false, "must never kill");
+  // Resume/refresh runs inside the session_open hook: reuse must cost one exec.
+  assert.equal(calls.length, 1);
 });
 
 test("ensureSession falls back to a command that cannot exit", async () => {
   const { run, calls } = fakeTmux([
-    { match: ["has-session"], result: fail() },
+    { match: HANDOFF, result: fail("can't find session: paseo-a") },
     { match: ["new-session"], result: fail("bad placeholder: no such file") },
-    { match: ["display-message", "-p", "-t", "paseo-a", "#{pane_id}"], result: ok("%9\n") },
-    { match: ["display-message", "-p", "#{socket_path}"], result: ok("/sock\n") },
+    { match: ["new-session"], result: ok("%9|/sock|\n") },
   ]);
   const result = await new TmuxClient(run).ensureSession({
     name: "paseo-a",
@@ -583,9 +616,12 @@ test("ensureSession falls back to a command that cannot exit", async () => {
 
 test("ensureSession fails soft when tmux refuses to create the session", async () => {
   const { run } = fakeTmux([
-    { match: ["has-session"], result: fail() },
+    { match: HANDOFF, result: fail("can't find session: paseo-a") },
     { match: ["new-session"], result: fail("boom: cannot create session") },
     { match: ["new-session"], result: fail("boom again") },
+    // The last probe is the concurrent-open check: another session_open may have
+    // created the session between the two failures. It must fail too.
+    { match: HANDOFF, result: fail("can't find session: paseo-a") },
   ]);
   const result = await new TmuxClient(run).ensureSession({
     name: "paseo-a",
@@ -622,8 +658,7 @@ test("ensureSession rejects an unsafe session name before touching tmux", async 
 
 test("ensureSession reports missing pane id / socket as failures", async () => {
   const noPane = fakeTmux([
-    { match: ["has-session"], result: ok() },
-    { match: ["display-message", "-p", "-t", "paseo-a", "#{pane_id}"], result: fail("no such") },
+    { match: HANDOFF, result: fail("no such") },
   ]);
   const a = await new TmuxClient(noPane.run).ensureSession({
     name: "paseo-a",
@@ -637,10 +672,9 @@ test("ensureSession reports missing pane id / socket as failures", async () => {
   if (a.ok) return;
   assert.equal(a.stage, "pane-id");
 
+  // Session exists but the handoff is unusable: no socket half.
   const noSocket = fakeTmux([
-    { match: ["has-session"], result: ok() },
-    { match: ["display-message", "-p", "-t", "paseo-a", "#{pane_id}"], result: ok("%3\n") },
-    { match: ["display-message", "-p", "#{socket_path}"], result: fail() },
+    { match: HANDOFF, result: ok("%3||\n") },
   ]);
   const b = await new TmuxClient(noSocket.run).ensureSession({
     name: "paseo-a",
@@ -930,15 +964,8 @@ test("the TMUX pid is the server pid inside the namespace, not the daemon's", as
   const seen: string[][] = [];
   const client = new TmuxClient(async (args) => {
     seen.push(args);
-    if (args[0] === "has-session") return { ok: true, stdout: "", stderr: "" };
-    if (args[0] === "display-message" && args[args.length - 1] === "#{pane_id}") {
-      return { ok: true, stdout: "%7\n", stderr: "" };
-    }
-    if (args[0] === "display-message" && args[args.length - 1] === "#{socket_path}") {
-      return { ok: true, stdout: "/tmp/tmux-1000/default\n", stderr: "" };
-    }
-    if (args[0] === "display-message" && args[args.length - 1] === "#{pid}") {
-      return { ok: true, stdout: "24601\n", stderr: "" };
+    if (args[0] === "display-message") {
+      return { ok: true, stdout: "%7|/tmp/tmux-1000/default|24601\n", stderr: "" };
     }
     return { ok: true, stdout: "", stderr: "" };
   });
@@ -954,9 +981,35 @@ test("the TMUX pid is the server pid inside the namespace, not the daemon's", as
   assert.equal(result.handle.socketPath, "/tmp/tmux-1000/default");
   assert.equal(result.handle.serverPid, 24601, "the pid inside the namespace, not the daemon's");
   assert.ok(
-    seen.some((args) => args[0] === "display-message" && args[args.length - 1] === "#{pid}"),
-    "the server pid must be asked for inside the namespace",
+    seen.every((args) => args[0] === "display-message" || args[0] === "select-layout"),
+    "the pid must come from the namespace, in the same call as the rest of the handoff",
   );
+});
+
+test("parseHandoff reads the one-call handoff and rejects junk", () => {
+  assert.deepEqual(parseHandoff("%18|/tmp/tmux-1000/default|\n"), {
+    paneId: "%18",
+    socketPath: "/tmp/tmux-1000/default",
+    serverPid: null, // this tmux 3.6 build leaves server_pid empty
+  });
+  assert.deepEqual(parseHandoff("%7|/sock|24601"), {
+    paneId: "%7",
+    socketPath: "/sock",
+    serverPid: 24601,
+  });
+  for (const junk of ["", "   ", "no pipes here", "|/sock|1"]) {
+    const parsed = parseHandoff(junk);
+    assert.equal(parsed.paneId, null, `${JSON.stringify(junk)} accepted a pane id`);
+  }
+  // A valid pane with a non-absolute socket is still unusable: the socket half is
+  // what fails, and it must not be passed through as a path.
+  assert.deepEqual(parseHandoff("%7|relative-not-absolute|1"), {
+    paneId: "%7",
+    socketPath: null,
+    serverPid: 1,
+  });
+  assert.equal(parseHandoff("%7|/sock|abc").serverPid, null);
+  assert.equal(parseHandoff("%7;kill-server|/sock|1").paneId, null);
 });
 
 test("bookkeeping pins the namespace the session was created in", () => {
