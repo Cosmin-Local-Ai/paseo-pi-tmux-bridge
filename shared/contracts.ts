@@ -176,6 +176,52 @@ export const killPaneRpc = defineRpc({
   output: z.object({ ok: z.boolean(), paneId: z.string(), detail: z.string().optional() }),
 });
 
+/**
+ * Named keys accepted by `send-keys`. Anything outside this list is rejected:
+ * a bare string would be interpreted by tmux as a key name, so free text must
+ * go through the `text` branch, which is sent with `-l` (literal).
+ */
+export const TMUX_KEY_NAMES = [
+  "Enter",
+  "C-c",
+  "C-d",
+  "C-l",
+  "Escape",
+  "Tab",
+  "BSpace",
+  "Up",
+  "Down",
+  "Left",
+  "Right",
+] as const;
+
+export type TmuxKeyName = (typeof TMUX_KEY_NAMES)[number];
+
+/**
+ * Type into a pane. This is what makes the panel more than a viewer: the text
+ * branch is delivered with `send-keys -l`, so tmux cannot reinterpret shell
+ * metacharacters as key names.
+ */
+export const sendKeysRpc = defineRpc({
+  name: "send-keys",
+  input: z.discriminatedUnion("mode", [
+    z.object({
+      agentId: agentIdSchema,
+      paneId: paneIdSchema,
+      mode: z.literal("text"),
+      text: z.string().min(1).max(2000),
+      enter: z.boolean().default(true),
+    }),
+    z.object({
+      agentId: agentIdSchema,
+      paneId: paneIdSchema,
+      mode: z.literal("key"),
+      key: z.enum(TMUX_KEY_NAMES),
+    }),
+  ]),
+  output: z.object({ ok: z.boolean(), paneId: z.string(), detail: z.string().optional() }),
+});
+
 export const openAttachTerminalRpc = defineRpc({
   name: "open-attach-terminal",
   input: z.object({ agentId: agentIdSchema }),

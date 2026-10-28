@@ -47,6 +47,8 @@ import {
   shellProbeInvocation,
   selectLayoutCmd,
   selectPaneCmd,
+  sendKeyCmd,
+  sendKeysLiteralCmd,
   sessionNameFor,
   shouldHandleSessionOpen,
   tmuxCandidatePaths,
@@ -364,11 +366,64 @@ test("command builders produce the spec'd argv", () => {
   ]);
 });
 
-test("capturePaneCmd clamps the history window", () => {
-  assert.deepEqual(capturePaneCmd("%3", 15), ["capture-pane", "-p", "-t", "%3", "-S", "-15"]);
-  assert.deepEqual(capturePaneCmd("%3", 0), ["capture-pane", "-p", "-t", "%3", "-S", "-1"]);
-  assert.deepEqual(capturePaneCmd("%3", -7), ["capture-pane", "-p", "-t", "%3", "-S", "-1"]);
-  assert.deepEqual(capturePaneCmd("%3", 9999), ["capture-pane", "-p", "-t", "%3", "-S", "-2000"]);
+test("capturePaneCmd clamps the history window and keeps colour", () => {
+  // `-e` is what makes the panel colourful: without it tmux strips every SGR
+  // sequence and the pane renders as flat grey text.
+  assert.deepEqual(capturePaneCmd("%3", 15), ["capture-pane", "-p", "-e", "-t", "%3", "-S", "-15"]);
+  assert.deepEqual(capturePaneCmd("%3", 0), ["capture-pane", "-p", "-e", "-t", "%3", "-S", "-1"]);
+  assert.deepEqual(capturePaneCmd("%3", -7), ["capture-pane", "-p", "-e", "-t", "%3", "-S", "-1"]);
+  assert.deepEqual(capturePaneCmd("%3", 9999), ["capture-pane", "-p", "-e", "-t", "%3", "-S", "-2000"]);
+});
+
+test("sendKeys builders keep text literal and keys named", () => {
+  // `-l` is the whole safety story: without it tmux would reinterpret tokens.
+  assert.deepEqual(sendKeysLiteralCmd("%3", "ls -la && echo hi"), [
+    "send-keys",
+    "-t",
+    "%3",
+    "-l",
+    "ls -la && echo hi",
+  ]);
+  assert.deepEqual(sendKeyCmd("%3", "C-c"), ["send-keys", "-t", "%3", "C-c"]);
+});
+
+test("sendText types literally, then presses Enter as a separate key", async () => {
+  const { run, calls } = fakeTmux([]);
+  const client = new TmuxClient(run);
+  const result = await client.sendText("%3", "echo hi", true);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [
+    ["send-keys", "-t", "%3", "-l", "echo hi"],
+    ["send-keys", "-t", "%3", "Enter"],
+  ]);
+
+  const again = fakeTmux([]);
+  await new TmuxClient(again.run).sendText("%3", "no newline", false);
+  assert.deepEqual(again.calls, [["send-keys", "-t", "%3", "-l", "no newline"]]);
+});
+
+test("sendText stops before Enter when the literal write fails", async () => {
+  const { run, calls } = fakeTmux([{ match: ["send-keys", "-t", "%3", "-l"], result: fail("no pane") }]);
+  const result = await new TmuxClient(run).sendText("%3", "x", true);
+  assert.equal(result.ok, false);
+  assert.equal(result.stderr, "no pane");
+  assert.equal(calls.length, 1);
+});
+
+test("sendKey refuses anything outside the named-key allowlist", async () => {
+  const { run, calls } = fakeTmux([]);
+  const client = new TmuxClient(run);
+  for (const key of ["kill-server", "C-z", "Enter ", "", "-H", "Up; kill-session"]) {
+    assert.equal((await client.sendKey("%3", key)).ok, false, `${JSON.stringify(key)} allowed`);
+  }
+  assert.equal(calls.length, 0);
+  assert.equal((await client.sendKey("nope", "C-c")).ok, false);
+});
+
+test("sendText refuses unsafe pane ids and empty text", async () => {
+  const client = new TmuxClient(async () => ok());
+  assert.equal((await client.sendText("%1;kill-server", "x", true)).ok, false);
+  assert.equal((await client.sendText("%3", "", true)).ok, false);
 });
 
 test("safety validators", () => {

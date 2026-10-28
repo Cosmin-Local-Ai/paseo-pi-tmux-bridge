@@ -7,7 +7,7 @@ import {
   type PluginAgentPanelProps,
   type PluginWorkspacePanelProps,
 } from "@getpaseo/plugin/client";
-import { Icon, Modal, useToast } from "@getpaseo/plugin/client/ui";
+import { Icon, Modal, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import {
   bridgeSettings,
   capturePaneRpc,
@@ -15,8 +15,18 @@ import {
   listPanesRpc,
   openAttachTerminalRpc,
   selectPaneRpc,
+  sendKeysRpc,
   type TmuxPaneDto,
 } from "../shared/contracts.ts";
+import {
+  buildThemePalette,
+  parseAnsi,
+  resolveInverse,
+  type AnsiLine,
+  type AnsiPalette,
+  type AnsiRun,
+  type AnsiVariant,
+} from "../shared/ansi.ts";
 
 interface Snapshot {
   agentId: string;
@@ -34,6 +44,81 @@ interface Snapshot {
 
 const POLL_INTERVAL_MS = 2000;
 const FALLBACK_CAPTURE_LINES = 15;
+/** A full-size tab has the room; do not hold it to the explorer's 15 lines. */
+const WIDE_CAPTURE_LINES = 48;
+
+/**
+ * `PluginTheme` carries no colorScheme, so the palette variant is inferred from
+ * the surface/foreground pair: a darker surface means a dark theme.
+ */
+function luminance(color: string): number | null {
+  const hex = color.trim().replace(/^#/, "");
+  const full =
+    hex.length === 3
+      ? hex
+          .split("")
+          .map((c) => c + c)
+          .join("")
+      : hex;
+  if (!/^[0-9a-fA-F]{6}$/.test(full)) return null;
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16) / 255);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function variantForTheme(theme: PluginAgentPanelProps["theme"]): AnsiVariant {
+  const surface = luminance(theme.colors.surface0);
+  const foreground = luminance(theme.colors.foreground);
+  if (surface === null || foreground === null) return "dark";
+  return surface <= foreground ? "dark" : "light";
+}
+
+function runStyle(run: AnsiRun, base: Record<string, unknown>): Record<string, unknown> {
+  const style: Record<string, unknown> = { ...base };
+  if (run.fg) style.color = run.fg;
+  if (run.bg) style.backgroundColor = run.bg;
+  if (run.bold) style.fontWeight = "bold";
+  if (run.italic) style.fontStyle = "italic";
+  if (run.dim) style.opacity = 0.62;
+  if (run.underline && run.strike) style.textDecorationLine = "underline line-through";
+  else if (run.underline) style.textDecorationLine = "underline";
+  else if (run.strike) style.textDecorationLine = "line-through";
+  return style;
+}
+
+/**
+ * One pane's screen, rendered with the same ANSI palette Paseo's own terminal
+ * uses. Each line is one Text so line boxes stay aligned; runs nest inside it.
+ */
+function AnsiScreen({
+  lines,
+  palette,
+  base,
+}: {
+  lines: AnsiLine[];
+  palette: AnsiPalette;
+  base: Record<string, unknown>;
+}) {
+  return (
+    <View style={{ backgroundColor: palette.defaultBg, padding: 8, borderRadius: 6 }}>
+      {lines.map((line, index) => (
+        <Text key={`line-${index}`} style={base}>
+          {line.runs.length === 0
+            ? " "
+            : line.runs
+                .filter((run) => run.text.length > 0)
+                .map((run, runIndex) => {
+                  const resolved = run.inverse ? resolveInverse(run, palette) : run;
+                  return (
+                    <Text key={`run-${index}-${runIndex}`} style={runStyle(resolved, base)}>
+                      {run.text}
+                    </Text>
+                  );
+                })}
+        </Text>
+      ))}
+    </View>
+  );
+}
 
 /**
  * Read-only view of the current agent's tmux session: pane inventory plus the
@@ -59,6 +144,7 @@ function TmuxPanelBody({
   const callSelectPane = useRpc(selectPaneRpc);
   const callKillPane = useRpc(killPaneRpc);
   const callOpenTerminal = useRpc(openAttachTerminalRpc);
+  const callSendKeys = useRpc(sendKeysRpc);
   const settings = useSettings(bridgeSettings);
   const toast = useToast();
 
@@ -67,10 +153,28 @@ function TmuxPanelBody({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [detailPane, setDetailPane] = useState<{ paneId: string; text: string } | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
   const inFlight = useRef(false);
 
-  const captureLines =
+  const settingLines =
     settings.status === "ready" ? settings.values.paneCaptureLines : FALLBACK_CAPTURE_LINES;
+  // The explorer pane is narrow and short; a workspace tab is not. Ask tmux for
+  // more history only when there is room to show it.
+  const captureLines = layout.compact ? settingLines : Math.max(settingLines, WIDE_CAPTURE_LINES);
+
+  const palette = useMemo(
+    () => buildThemePalette(theme, variantForTheme(theme)),
+    [theme],
+  );
+  const ansiBase = useMemo(
+    () => ({
+      color: palette.defaultFg,
+      fontFamily: "monospace",
+      fontSize: layout.compact ? 11 : 12.5,
+      lineHeight: layout.compact ? 14 : 17,
+    }),
+    [layout.compact, palette.defaultFg],
+  );
 
   const refresh = useCallback(async () => {
     if (inFlight.current) return;
@@ -87,6 +191,7 @@ function TmuxPanelBody({
         result.panes.map(async (pane) => {
           try {
             const captured = await callCapturePane({ agentId, paneId: pane.paneId, lines: captureLines });
+            // Colour comes from tmux `-e`; junk was already stripped server-side.
             return [pane.paneId, captured.detail ? `${captured.detail}` : captured.text] as const;
           } catch {
             return [pane.paneId, ""] as const;
@@ -150,6 +255,28 @@ function TmuxPanelBody({
     [agentId, callOpenTerminal, runAction],
   );
 
+  const handleSendText = useCallback(
+    (paneId: string) => {
+      const text = (draft[paneId] ?? "").trim();
+      if (text.length === 0) return;
+      return runAction(`send:${paneId}`, async () => {
+        const result = await callSendKeys({ agentId, paneId, mode: "text", text, enter: true });
+        if (!result.ok) throw new Error(result.detail ?? "send-keys failed");
+        setDraft((current) => ({ ...current, [paneId]: "" }));
+      }, `Sent to ${paneId}`);
+    },
+    [agentId, callSendKeys, draft, runAction],
+  );
+
+  const handleSendKey = useCallback(
+    (paneId: string, key: "C-c" | "Escape") =>
+      runAction(`key:${paneId}:${key}`, async () => {
+        const result = await callSendKeys({ agentId, paneId, mode: "key", key });
+        if (!result.ok) throw new Error(result.detail ?? `send-keys ${key} failed`);
+      }, `${key} sent to ${paneId}`),
+    [agentId, callSendKeys, runAction],
+  );
+
   const handleInspect = useCallback(
     async (paneId: string) => {
       try {
@@ -185,6 +312,19 @@ function TmuxPanelBody({
       screen_: {
         color: theme.colors.foregroundMuted,
         fontSize: 11,
+        fontFamily: "monospace",
+      },
+      input: {
+        flex: 1,
+        minWidth: 140,
+        paddingHorizontal: 10,
+        paddingVertical: 7,
+        borderRadius: 8,
+        borderWidth: 1,
+        borderColor: theme.colors.border,
+        backgroundColor: theme.colors.surface2,
+        color: theme.colors.foreground,
+        fontSize: 12,
         fontFamily: "monospace",
       },
       row: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
@@ -320,9 +460,44 @@ function TmuxPanelBody({
           <Text style={styles.paneTitle}>
             {`index ${pane.paneIndex} · pid ${pane.panePid} · title ${pane.paneTitle || "(none)"}`}
           </Text>
-          <Text style={styles.screen_} numberOfLines={captureLines}>
-            {captures[pane.paneId] || "(no captured output)"}
-          </Text>
+          {captures[pane.paneId] ? (
+            <AnsiScreen
+              lines={parseAnsi(captures[pane.paneId], palette)}
+              palette={palette}
+              base={ansiBase}
+            />
+          ) : (
+            <Text style={styles.screen_}>{"(no captured output)"}</Text>
+          )}
+          <View style={styles.row}>
+            <TextInput
+              style={styles.input}
+              value={draft[pane.paneId] ?? ""}
+              onChangeText={(text) => setDraft((current) => ({ ...current, [pane.paneId]: text }))}
+              onSubmitEditing={() => void handleSendText(pane.paneId)}
+              returnKeyType="send"
+              submitBehavior="submit"
+              placeholder={`type into ${pane.paneId}…`}
+              placeholderTextColor={theme.colors.foregroundMuted}
+              multiline={false}
+            />
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => void handleSendText(pane.paneId)}
+              style={[styles.button, styles.primary]}
+              disabled={busy === `send:${pane.paneId}` || (draft[pane.paneId] ?? "").trim() === ""}
+            >
+              <Text style={styles.primaryText}>Send</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => handleSendKey(pane.paneId, "C-c")}
+              style={styles.button}
+              disabled={busy === `key:${pane.paneId}:C-c`}
+            >
+              <Text style={styles.danger}>Ctrl-C</Text>
+            </Pressable>
+          </View>
           <View style={styles.row}>
             <Pressable
               accessibilityRole="button"
@@ -359,7 +534,9 @@ function TmuxPanelBody({
         }}
       >
         <Modal.Content>
-          <Text style={styles.screen_}>{detailPane?.text ?? ""}</Text>
+          {detailPane?.text
+            ? <AnsiScreen lines={parseAnsi(detailPane.text, palette)} palette={palette} base={ansiBase} />
+            : <Text style={styles.screen_}>{""}</Text>}
         </Modal.Content>
       </Modal>
     </View>

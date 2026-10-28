@@ -18,6 +18,14 @@ const CHECKOUT = process.env.CHECKOUT ?? process.cwd();
 const DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const COMPILER = path.join(CHECKOUT, "packages/server/src/server/plugins/compiler.ts");
 
+// Derived from the contracts, not hardcoded, so a new RPC cannot be added on one
+// side of the wire and silently pass this check.
+const RPC_NAMES = [
+  ...readFileSync(path.join(DIR, "shared/contracts.ts"), "utf8").matchAll(
+    /defineRpc\(\{\s*name:\s*"([^"]+)"/g,
+  ),
+].map((match) => match[1]);
+
 if (!existsSync(COMPILER)) {
   console.error(
     `No Paseo compiler at ${COMPILER}.\n` +
@@ -57,12 +65,8 @@ const report = {
   serverRegistersSessionOpen: (result.serverBundle ?? "").includes("agent.session_open"),
   serverHasKillGuard: (result.serverBundle ?? "").includes("isOwnSessionName"),
   clientHasAgentPanel: (result.clientBundle ?? "").includes("addAgentPanel"),
-  clientHasRpcNames: ["session-status", "list-panes", "capture-pane", "select-pane", "kill-pane", "open-attach-terminal"].filter(
-    (name) => (result.clientBundle ?? "").includes(name),
-  ),
-  serverHasRpcNames: ["session-status", "list-panes", "capture-pane", "select-pane", "kill-pane", "open-attach-terminal"].filter(
-    (name) => (result.serverBundle ?? "").includes(name),
-  ),
+  clientHasRpcNames: RPC_NAMES.filter((name) => (result.clientBundle ?? "").includes(name)),
+  serverHasRpcNames: RPC_NAMES.filter((name) => (result.serverBundle ?? "").includes(name)),
 };
 
 console.log(JSON.stringify(report, null, 2));
@@ -73,8 +77,9 @@ const ok =
   report.serverHasContribute &&
   report.serverRegistersSessionOpen &&
   report.clientHasAgentPanel &&
-  report.serverHasRpcNames.length === 6 &&
-  report.clientHasRpcNames.length === 6 &&
+  RPC_NAMES.length >= 7 &&
+  report.serverHasRpcNames.length === RPC_NAMES.length &&
+  report.clientHasRpcNames.length === RPC_NAMES.length &&
   report.contributionIdsChecked >= 6 &&
   report.badContributionIds.length === 0;
 

@@ -489,8 +489,43 @@ export function listPanesCmd(name: string): string[] {
 
 export function capturePaneCmd(paneId: string, lines: number): string[] {
   const bounded = Math.max(1, Math.min(2000, Math.trunc(lines) || 1));
-  return ["capture-pane", "-p", "-t", paneId, "-S", `-${bounded}`];
+  // `-e` keeps the SGR sequences tmux holds in its pane history, which is what
+  // lets the panel render colours instead of grey text. Everything that is not
+  // SGR is stripped server-side by `sanitizeCapture` before it crosses the wire.
+  return ["capture-pane", "-p", "-e", "-t", paneId, "-S", `-${bounded}`];
 }
+
+/**
+ * Literal text: `-l` stops tmux from interpreting the payload as key names, so
+ * shell metacharacters reach the pane as characters.
+ */
+export function sendKeysLiteralCmd(paneId: string, text: string): string[] {
+  return ["send-keys", "-t", paneId, "-l", text];
+}
+
+/** Named key only. Free text must never reach this - use `sendKeysLiteralCmd`. */
+export function sendKeyCmd(paneId: string, key: string): string[] {
+  return ["send-keys", "-t", paneId, key];
+}
+
+/**
+ * Defense in depth: the RPC schema (`TMUX_KEY_NAMES` in shared/contracts.ts)
+ * already rejects anything else, but `TmuxClient` is also reachable from tests
+ * and future call sites.
+ */
+const TMUX_KEY_NAMES: readonly string[] = [
+  "Enter",
+  "C-c",
+  "C-d",
+  "C-l",
+  "Escape",
+  "Tab",
+  "BSpace",
+  "Up",
+  "Down",
+  "Left",
+  "Right",
+];
 
 export function selectPaneCmd(paneId: string): string[] {
   return ["select-pane", "-t", paneId];
@@ -778,6 +813,33 @@ export class TmuxClient {
       return { ok: false, stdout: "", stderr: `unsafe pane id: ${paneId}` };
     }
     return this.run(killPaneCmd(paneId));
+  }
+
+  /**
+   * Type into a pane. The literal payload and the optional Enter are two calls:
+   * folding Enter into the `-l` call would type the letters "Enter".
+   */
+  async sendText(paneId: string, text: string, enter: boolean): Promise<TmuxRunResult> {
+    if (!isSafePaneId(paneId)) {
+      return { ok: false, stdout: "", stderr: `unsafe pane id: ${paneId}` };
+    }
+    if (text.length === 0) {
+      return { ok: false, stdout: "", stderr: "empty text" };
+    }
+    const typed = await this.run(sendKeysLiteralCmd(paneId, text));
+    if (!typed.ok) return typed;
+    if (!enter) return typed;
+    return this.run(sendKeyCmd(paneId, "Enter"));
+  }
+
+  async sendKey(paneId: string, key: string): Promise<TmuxRunResult> {
+    if (!isSafePaneId(paneId)) {
+      return { ok: false, stdout: "", stderr: `unsafe pane id: ${paneId}` };
+    }
+    if (!TMUX_KEY_NAMES.includes(key)) {
+      return { ok: false, stdout: "", stderr: `key not allowed: ${key}` };
+    }
+    return this.run(sendKeyCmd(paneId, key));
   }
 
   /** Only ever called with a name produced by `sessionNameFor`. */

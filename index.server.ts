@@ -11,9 +11,11 @@ import {
   listPanesRpc,
   openAttachTerminalRpc,
   selectPaneRpc,
+  sendKeysRpc,
   sessionStatusRpc,
 } from "./shared/contracts.ts";
 import type { BridgeSettings } from "./shared/contracts.ts";
+import { sanitizeCapture } from "./shared/ansi.ts";
 import { BridgeBookkeeping } from "./server/bookkeeping.ts";
 import {
   AMOS_LAYOUT,
@@ -798,8 +800,16 @@ export default function contribute(server: PluginServerContext): () => void {
     }
     const result = await tmux.capturePane(input.paneId, input.lines ?? settings.paneCaptureLines);
     if (!result.ok) return { paneId: input.paneId, text: "", lines: 0, detail: result.stderr };
-    const text = result.stdout.replace(/\s+$/u, "");
-    return { paneId: input.paneId, text, lines: text.length === 0 ? 0 : text.split("\n").length };
+    // `-e` keeps colours; everything that is not an SGR sequence is dropped here
+    // so the client never has to defend against cursor/OSC junk.
+    const captured = sanitizeCapture(result.stdout);
+    const body = captured.text.replace(/\s+$/u, "");
+    return {
+      paneId: input.paneId,
+      text: body,
+      lines: body.length === 0 ? 0 : body.split("\n").length,
+      ...(captured.truncated ? { detail: "capture truncated" } : {}),
+    };
   });
 
   server.handle(selectPaneRpc, async (input) => {
@@ -823,6 +833,23 @@ export default function contribute(server: PluginServerContext): () => void {
       return { ok: false, paneId: input.paneId, detail: "pane is not in this agent's session" };
     }
     const result = await tmux.killPane(input.paneId);
+    return { ok: result.ok, paneId: input.paneId, detail: result.ok ? undefined : result.stderr };
+  });
+
+  // Typing into a pane is the one RPC that changes agent state, so it repeats
+  // the ownership check: the pane must belong to this agent's session.
+  server.handle(sendKeysRpc, async (input) => {
+    const { name } = await sessionFor(input.agentId);
+    if (!name) return { ok: false, paneId: input.paneId, detail: "unknown agent" };
+    const { tmux } = await clientForAgent(input.agentId, name);
+    const panes = await tmux.listPanes(name);
+    if (!panes.some((pane) => pane.paneId === input.paneId)) {
+      return { ok: false, paneId: input.paneId, detail: "pane is not in this agent's session" };
+    }
+    const result =
+      input.mode === "text"
+        ? await tmux.sendText(input.paneId, input.text, input.enter)
+        : await tmux.sendKey(input.paneId, input.key);
     return { ok: result.ok, paneId: input.paneId, detail: result.ok ? undefined : result.stderr };
   });
 

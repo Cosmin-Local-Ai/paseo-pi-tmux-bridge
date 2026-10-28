@@ -100,20 +100,42 @@ and adds three ways in:
 
 | entry point | where the view lands |
 | --- | --- |
+| `/tmux` in the agent composer | a **full-size workspace tab** |
+| `/tmux-side` in the agent composer | the **explorer pane**, docked beside the agent chat |
 | `+` (new tab) → **tmux panes** | a workspace tab; picks the agent for you |
-| Command Center (`Search`) → **Open tmux panel for this agent** | the **explorer pane**, docked beside the agent chat |
-| `/tmux` in the agent composer | the explorer pane |
+| Command Center (`Search`) → **Open tmux panes for this agent** | full-size workspace tab |
+| Command Center → **Dock tmux panes beside this agent's chat** | the explorer pane |
+| Command Center → **Open tmux panes (any agent in this workspace)** | workspace tab, needs no agent in context |
 | Command Center → **Open attach terminal for this agent** | a `tmux attach -t <session>` terminal tab |
 | Command Center → **Configure Pi tmux bridge** | the settings screen |
 
-The explorer placement is the one that answers "I want to see the panes next to the session, without
-clicking around": the panel stays docked on the right, polls every 2s, and a subagent that tmux
-splits to the right shows up on the right — main pane and subagent pane side by side. Paseo persists
-the explorer pane per workspace, so after opening it once it is there again on the next visit.
+`/tmux` opens the full-size tab because the explorer pane is narrow: the same view renders far better
+as a tab. Docking is still there when you want the panes literally beside the session — the panel
+polls every 2s, and with the default `even-horizontal` layout a subagent tmux splits to the right
+shows up on the right, side by side with the main pane. Paseo persists the explorer pane per
+workspace, so after docking it once it is there again on the next visit.
+
+Two Paseo behaviours worth knowing, because both look like the plugin being broken:
+
+- **Ctrl+K does nothing while a terminal has focus.** `packages/app/src/keyboard/keyboard-shortcuts.ts`
+  registers the non-mac binding with `when: { mac: false, terminal: false }`. Click out of the terminal,
+  or just use `/tmux` — the composer needs no shortcut.
+- **Agent-context Command Center items are hidden unless a workspace *and* an agent are current**
+  (`packages/app/src/plugins/command-center/contributions.ts`: `if (item.context === "agent" &&
+  (!source.workspaceId || !source.agentId)) continue;`). That is why the workspace-level item exists.
 
 The panel shows the session name, pane count, and per pane: id, index, `pane_current_command`, pid,
-title, size, and the last N captured screen lines. Buttons: **Focus** (`select-pane`), **Kill pane**
-(`kill-pane`), **Open attach terminal**. Clicking a pane header opens a modal with a longer capture.
+title, size, and the last N captured screen lines **in colour** — tmux is captured with `capture-pane
+-e`, non-SGR sequences are stripped server-side, and the runs are painted with Paseo's own terminal
+ANSI palette (see `shared/ansi.ts`). N is `paneCaptureLines` (default 15) in the docked pane and 48 in
+a full-size tab. Per pane there is an input box: **Send** delivers the text with `send-keys -l` (so
+shell metacharacters arrive as characters, never as key names) followed by a separate `Enter`, and
+**Ctrl-C** sends the named key `C-c`. Buttons: **Focus** (`select-pane`), **Kill pane** (`kill-pane`),
+**Open attach terminal**. Clicking a pane header opens a modal with a longer capture.
+
+Typing into a pane is the only RPC that changes agent state, so it repeats the ownership check: the
+pane must belong to that agent's session, and named keys are limited to an allowlist
+(`TMUX_KEY_NAMES` in `shared/contracts.ts`).
 
 Then just ask the agent to use the `subagent` tool as you would inside tmux.
 

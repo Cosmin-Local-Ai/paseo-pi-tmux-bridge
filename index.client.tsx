@@ -44,16 +44,43 @@ export default function contribute(client: PluginClientContext) {
     Component: BridgeSettingsScreen,
   });
 
+  // `workspace` opens the panel as a full-size workspace tab; `explorer` docks it
+  // in the narrow explorer pane beside the chat. Paseo's default for a panel that
+  // declares both is `workspace`, so that is what the primary entry points use.
   const openPanelItem = client.addCommandCenterItem({
     id: "open-panel",
-    title: "Open tmux panel for this agent",
+    title: "Open tmux panes for this agent",
     icon: "Terminal",
     keywords: ["tmux", "pane", "subagent", "bridge"],
     context: "agent",
     onSelect({ openPanel }) {
-      // `explorer` docks the panel in the explorer pane, side by side with the
-      // agent chat, instead of adding another workspace tab to click through.
+      openPanel(AGENT_PANEL_ID, { location: "workspace" });
+    },
+  });
+
+  const openDockedPanelItem = client.addCommandCenterItem({
+    id: "open-panel-docked",
+    title: "Dock tmux panes beside this agent's chat",
+    icon: "Terminal",
+    keywords: ["tmux", "pane", "side", "docked", "explorer"],
+    context: "agent",
+    onSelect({ openPanel }) {
       openPanel(AGENT_PANEL_ID, { location: "explorer" });
+    },
+  });
+
+  // Agent-context items are dropped unless BOTH a workspace and an agent are the
+  // current context (`packages/app/src/plugins/command-center/contributions.ts`),
+  // so the same view is offered at workspace level for when the command center is
+  // opened from a workspace rather than an agent.
+  const openWorkspacePanelItem = client.addCommandCenterItem({
+    id: "open-workspace-panel",
+    title: "Open tmux panes (any agent in this workspace)",
+    icon: "Terminal",
+    keywords: ["tmux", "pane", "subagent", "bridge", "workspace"],
+    context: "workspace",
+    onSelect({ openPanel }) {
+      openPanel(WORKSPACE_PANEL_ID, { location: "workspace" });
     },
   });
 
@@ -88,9 +115,22 @@ export default function contribute(client: PluginClientContext) {
 
   // The composer is where a user actually is, so `/tmux` is the shortest path
   // from "I cannot find the panel" to a rendered panel.
+  // The composer is where a user actually is, and it needs no keyboard shortcut:
+  // Ctrl+K is suppressed while a terminal has focus (`keyboard-shortcuts.ts`,
+  // `when: { mac: false, terminal: false }`), which is exactly when panes are up.
   const slashCommand = client.addSlashCommand({
     name: "tmux",
-    description: "Open the tmux panel for this agent",
+    description: "Open this agent's tmux panes as a full-size tab",
+    argumentHint: "",
+    context: "agent",
+    onSubmit({ openPanel }) {
+      openPanel(AGENT_PANEL_ID, { location: "workspace" });
+    },
+  });
+
+  const slashCommandDocked = client.addSlashCommand({
+    name: "tmux-side",
+    description: "Dock this agent's tmux panes beside the chat",
     argumentHint: "",
     context: "agent",
     onSubmit({ openPanel }) {
@@ -103,8 +143,11 @@ export default function contribute(client: PluginClientContext) {
     workspacePanel();
     settingsScreen();
     openPanelItem();
+    openDockedPanelItem();
+    openWorkspacePanelItem();
     openTerminalItem();
     settingsItem();
     slashCommand();
+    slashCommandDocked();
   };
 }
