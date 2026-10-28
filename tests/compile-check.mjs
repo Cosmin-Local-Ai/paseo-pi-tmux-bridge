@@ -63,6 +63,8 @@ const report = {
     result.serverBundle ?? "",
   ),
   serverRegistersSessionOpen: (result.serverBundle ?? "").includes("agent.session_open"),
+  // The create-path guard (dropping the app's toolPolicy) lives in this hook.
+  serverRegistersAgentCreate: (result.serverBundle ?? "").includes("agent.create"),
   serverHasKillGuard: (result.serverBundle ?? "").includes("isOwnSessionName"),
   clientHasAgentPanel: (result.clientBundle ?? "").includes("addAgentPanel"),
   clientHasRpcNames: RPC_NAMES.filter((name) => (result.clientBundle ?? "").includes(name)),
@@ -76,6 +78,7 @@ const ok =
   report.clientBundleBytes > 1000 &&
   report.serverHasContribute &&
   report.serverRegistersSessionOpen &&
+  report.serverRegistersAgentCreate &&
   report.clientHasAgentPanel &&
   RPC_NAMES.length >= 7 &&
   report.serverHasRpcNames.length === RPC_NAMES.length &&

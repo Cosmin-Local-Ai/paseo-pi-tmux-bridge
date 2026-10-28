@@ -39,6 +39,7 @@ import {
   buildTmuxUnavailableEnv,
   execLabel,
   isOwnSessionName,
+  isPiProviderId,
   parsePathLookup,
   pathBaseFor,
   resolveExecPrefix,
@@ -493,6 +494,46 @@ export default function contribute(server: PluginServerContext): () => void {
     }, 0);
     if (typeof timer.unref === "function") timer.unref();
   }
+
+  // ── before("agent.create") ───────────────────────────────────────────
+
+  /**
+   * Paseo's hub/app create path attaches a `toolPolicy` - exact preapproval of
+   * MCP tools for unattended runs. The provider contract table in
+   * `server/agent/provider-registry.ts` grants that only to claude, codex and
+   * opencode, so a Pi provider is refused **before Pi is even spawned**:
+   *
+   *   Provider 'pi-recovery' cannot preapprove exact MCP tools for unattended
+   *   execution; select Claude, Codex, or OpenCode
+   *
+   * The contract is keyed by provider id and there is no config knob for a custom
+   * provider to opt in. Dropping the grant is the safe direction: it removes
+   * preapproval, so Pi's own permission flow applies instead of anything being
+   * silently widened.
+   */
+  server.before("agent.create", async (input) => {
+    const settings = await currentSettings();
+    if (!settings.enabled) return;
+    const config = input.request.config;
+    if (!config.toolPolicy) return;
+    if (
+      !isPiProviderId(config.provider, {
+        extraProviderIds: settings.piProviders,
+        autoDetect: settings.autoDetectPiProviders,
+      })
+    ) {
+      return;
+    }
+    const grants = config.toolPolicy.preapproved?.length ?? 0;
+    const next = { ...config };
+    delete next.toolPolicy;
+    log(
+      `dropped toolPolicy for provider ${config.provider} (${grants} preapproved MCP tool grant(s)): `
+        + `Paseo grants exact MCP preapproval only to claude/codex/opencode, and that guard refuses the `
+        + `whole create. Pi's own permission flow applies instead.`,
+    );
+    return { config: next, env: input.request.env };
+  });
 
   // ── before("agent.session_open") ─────────────────────────────────────────
 
