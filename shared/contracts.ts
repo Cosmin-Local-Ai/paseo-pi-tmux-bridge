@@ -80,7 +80,13 @@ export const bridgeSettings = defineSettings({
      * is cheap enough to run far faster than the old 2s screen poll; a capture
      * is only paid for panes whose pipe log actually grew.
      */
-    livePollMs: z.number().int().min(200).max(10000).default(600),
+    /**
+     * Tick interval for the panel's stream poll. Each tick costs one `list-panes`
+     * plus one pipe-log listing, plus one capture per changed pane - all through the
+     * namespace exec prefix - so the honest floor rises with the pane count. 1000ms
+     * is what a three-subagent session sustains; drop it for a single pane.
+     */
+    livePollMs: z.number().int().min(200).max(10000).default(1000),
   }),
 });
 
@@ -189,6 +195,12 @@ export const streamPanesRpc = defineRpc({
     sessionName: z.string(),
     exists: z.boolean(),
     tmuxAvailable: z.boolean(),
+    /**
+     * A tick for this agent is already running, so this call returned nothing
+     * useful. The client must skip it entirely - pruning captures on a busy tick
+     * would blank the panel while a slow capture is still in flight.
+     */
+    busy: z.boolean().default(false),
     panes: z.array(
       z.object({
         paneId: z.string(),

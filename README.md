@@ -152,7 +152,7 @@ change-signal loop, which keeps the rendering honest:
 3. `selectChangedPanes` compares sizes against the last good baseline. Only panes that actually
    produced output (or have no baseline yet, or lost their log) are re-captured with
    `capture-pane -p -e`; everything else returns `changed: false` and is not repainted.
-4. The header says `live · 600ms`, or `paused` when the tab is hidden, there is no session, tmux is
+4. The header says `live · 1000ms`, or `paused` when the tab is hidden, there is no session, tmux is
    unavailable, or a tick failed.
 
 Why not replay the pipe log directly? Because on tmux 3.6 that stream is the raw feed — keystroke
@@ -166,6 +166,17 @@ and `pane_output_size` all expand to **empty** on this tmux 3.6 build, which is 
 
 The logs hold pane text, so they can contain anything the agent printed. They live inside the sandbox,
 under `/tmp/pi-tmux-bridge/`, and die with the session.
+
+A tick is not free: `list-panes` + one pipe-log listing + one capture per changed pane, every one of
+them an exec through the namespace prefix. With three subagent panes that is up to six container execs,
+so the default is 1000ms and overlapping ticks are refused (`busy`) rather than stacked. Paseo's
+plugin-RPC budget is 30s (`plugins/runtime.ts: REQUEST_TIMEOUT_MS`); exceeding it shows as
+`Plugin RPC timed out: pi-tmux-bridge.invoke`.
+
+For the same reason a failed tmux probe is cached for 30s and the long retry pass only runs when the
+first pass failed *slowly*. `targetForAgent` starts with the host prefix for agents that have no pinned
+record, and on a daemon host without tmux an uncached probe plus a 25s retry costs more than the RPC
+budget - which is exactly how that timeout appeared after a few subagents were spawned at once.
 
 ## Settings
 
@@ -184,7 +195,7 @@ under `/tmp/pi-tmux-bridge/`, and die with the session.
 | `autoAttachTerminal` | `true` | open the attach terminal automatically |
 | `killOnClose` | `true` | kill the session on close/archive |
 | `paneCaptureLines` | `15` | capture depth in the panel |
-| `livePollMs` | `600` | how often the panel asks whether a pane produced output (200-10000) |
+| `livePollMs` | `1000` | how often the panel asks whether a pane produced output (200-10000) |
 | `autoDetectPiProviders` | `true` | treat `pi`-derived provider ids (`pi-recovery`, …) as Pi |
 | `piProviders` | `[]` | exact extra provider ids to treat as Pi |
 | `stripAmosIdentity` | `true` | drop inherited `PI_SUBAGENT_*` vars from the agent env |

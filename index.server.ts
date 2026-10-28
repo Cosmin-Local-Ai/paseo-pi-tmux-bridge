@@ -120,6 +120,17 @@ export default function contribute(server: PluginServerContext): () => void {
   const targets = new Map<string, TmuxTarget>();
   const targetsInFlight = new Map<string, Promise<TmuxTarget>>();
   /**
+   * "This namespace has no tmux" stays true for a while, but not forever (tmux can
+   * be installed into an image later), so a miss is held for a bounded time. Without
+   * it every panel tick re-probes a dead namespace: `targetForAgent` starts its loop
+   * with the host prefix (`""`) for agents that have no pinned record, and a host
+   * without tmux plus a retry pass costs more than Paseo's 30s plugin-RPC budget
+   * (`plugins/runtime.ts: REQUEST_TIMEOUT_MS`), which surfaces as
+   * `Plugin RPC timed out: pi-tmux-bridge.invoke`.
+   */
+  const TARGET_MISS_TTL_MS = 30_000;
+  const targetsMiss = new Map<string, { target: TmuxTarget; expiresAt: number }>();
+  /**
    * Streaming state for `stream-panes`.
    *
    * `paneLogSizes` is the change signal: the byte size each pane's pipe log had
@@ -133,6 +144,8 @@ export default function contribute(server: PluginServerContext): () => void {
    */
   const paneLogSizes = new Map<string, Record<string, number>>();
   const panePipesArmed = new Set<string>();
+  /** One stream tick per agent at a time, so a slow exec cannot stack polls. */
+  const streamInFlight = new Set<string>();
   const panePipesRearmed = new Set<string>();
 
   function clearPaneStreamState(agentId: string): void {
@@ -161,6 +174,7 @@ export default function contribute(server: PluginServerContext): () => void {
       // tmuxPath / prefix changed: throw the cached resolutions away.
       targets.clear();
       targetsInFlight.clear();
+      targetsMiss.clear();
     }
     settingsCache = state.values;
   });
@@ -278,6 +292,8 @@ export default function contribute(server: PluginServerContext): () => void {
     if (cached) return cached;
     const pending = targetsInFlight.get(provider);
     if (pending) return pending;
+    const miss = targetsMiss.get(provider);
+    if (miss && miss.expiresAt > Date.now()) return miss.target;
     const work = (async () => {
       const settings = await currentSettings();
       const rawPrefix = resolveExecPrefix({
@@ -289,9 +305,20 @@ export default function contribute(server: PluginServerContext): () => void {
       const label = execLabel(prefix);
       const configured = typeof settings.tmuxPath === "string" ? settings.tmuxPath.trim() : "";
       const candidates = tmuxCandidatePaths(process.env.HOME);
+      const firstDeadline = TMUX_PROBE_DEADLINES_MS[0]!;
+      const startedAt = Date.now();
       let attempt = 0;
-      let probed = await probeTmuxTarget(prefix, configured, candidates, TMUX_PROBE_DEADLINES_MS[0]!, signal);
-      while (!probed.path && !signal?.aborted && attempt + 1 < TMUX_PROBE_DEADLINES_MS.length) {
+      let probed = await probeTmuxTarget(prefix, configured, candidates, firstDeadline, signal);
+      // Only a *slow* failure means "that namespace was not up yet". A host with no
+      // tmux answers in milliseconds; re-probing one for another 25s would push an
+      // RPC past the plugin-RPC timeout, so the extra pass is reserved for timeouts.
+      const slow = Date.now() - startedAt >= firstDeadline * 0.75;
+      while (
+        !probed.path &&
+        slow &&
+        !signal?.aborted &&
+        attempt + 1 < TMUX_PROBE_DEADLINES_MS.length
+      ) {
         attempt += 1;
         log(
           `tmux probe in ${label} failed on attempt ${attempt}; retrying with a `
@@ -310,6 +337,7 @@ export default function contribute(server: PluginServerContext): () => void {
       // Only successes are cached. Caching a miss used to pin a whole provider to
       // an empty TMUX for the rest of the daemon's life.
       if (target.path) targets.set(provider, target);
+      else targetsMiss.set(provider, { target, expiresAt: Date.now() + TARGET_MISS_TTL_MS });
       log(
         target.path
           ? `tmux resolved to ${target.path} (${label})`
@@ -941,6 +969,20 @@ export default function contribute(server: PluginServerContext): () => void {
    * last screen it had rather than blanking.
    */
   server.handle(streamPanesRpc, async (input) => {
+    // A 600ms poll over container execs can outlive its own tick. Stacking them
+    // is how a panel turns into `Plugin RPC timed out`, so overlapping calls return
+    // `busy` and the client skips them.
+    if (streamInFlight.has(input.agentId)) {
+      return {
+        agentId: input.agentId,
+        sessionName: "",
+        exists: true,
+        tmuxAvailable: true,
+        busy: true,
+        panes: [],
+      };
+    }
+    streamInFlight.add(input.agentId);
     const problems: string[] = [];
     try {
       const { settings, name } = await sessionFor(input.agentId);
@@ -1078,6 +1120,8 @@ export default function contribute(server: PluginServerContext): () => void {
         panes: [],
         detail: `stream-panes failed: ${describeError(error)}`,
       };
+    } finally {
+      streamInFlight.delete(input.agentId);
     }
   });
 

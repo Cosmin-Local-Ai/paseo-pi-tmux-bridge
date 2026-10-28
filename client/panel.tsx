@@ -240,6 +240,13 @@ function TmuxPanelBody({
     streamInFlight.current = true;
     try {
       const result = await callStreamPanes({ agentId, lines: captureLines });
+      if (result.busy) {
+        // Another view (agent panel plus workspace panel, or a second window) owns
+        // the tick for this agent. Skip without touching captures: an empty pane
+        // list on a busy tick must not blank the panel.
+        setLiveMs(null);
+        return;
+      }
       setLiveMs(livePollMs);
       setCaptures((current) => {
         let next = current;
