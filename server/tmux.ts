@@ -495,6 +495,152 @@ export function capturePaneCmd(paneId: string, lines: number): string[] {
   return ["capture-pane", "-p", "-e", "-t", paneId, "-S", `-${bounded}`];
 }
 
+// ── pipe-pane change signal ────────────────────────────────────────────────
+
+/**
+ * `capture-pane -p -e` is the only correct way to **read** a pane: the raw
+ * pipe-pane byte stream carries keystroke echo, CRs and full-screen redraws, so
+ * replaying it would need a terminal emulator. But capture is also the expensive
+ * call, and paying it for every pane on every tick is what makes the panel look
+ * like a 2-second slideshow.
+ *
+ * `pipe-pane` supplies the cheap half: tmux appends every byte a pane produces
+ * to a file, so the file's byte size is a change signal, and ONE listing of the
+ * log directory says which panes are worth capturing.
+ *
+ * Why not a tmux format instead? `pane_last_output`, `pane_changed`,
+ * `pane_history_lines` and `pane_output_size` all expand to the empty string in
+ * the tmux 3.6 build inside the sandbox namespace (measured on this machine), so
+ * nothing on the pane itself can be polled.
+ */
+export const PANE_LOG_ROOT = "/tmp/pi-tmux-bridge";
+
+/**
+ * Where the pipe logs live — **inside the namespace tmux runs in**, because the
+ * daemon cannot read a file the container created, so listing them goes through
+ * the same exec prefix as every other tmux call.
+ *
+ * Flat on purpose: the file name already carries the session name, so a
+ * per-session subdirectory would add a path segment without adding isolation,
+ * and one `wc -c` listing still covers it. Returns "" for a name that must not
+ * be turned into a path — the validator is the guard, not the caller's intent.
+ */
+export function paneLogDir(sessionPrefix: string): string {
+  return isSafeSessionName(sessionPrefix) ? PANE_LOG_ROOT : "";
+}
+
+/**
+ * `/tmp/pi-tmux-bridge/<sessionName>.<paneId without %>.log`, or "" when either
+ * name is unsafe. `/` is not in the safe-name character class and a safe name
+ * cannot start with a dot, so no path traversal is reachable from here.
+ */
+export function paneLogPath(sessionName: string, paneId: string): string {
+  if (!isSafeSessionName(sessionName) || !isSafePaneId(paneId)) return "";
+  return `${PANE_LOG_ROOT}/${sessionName}.${paneId.slice(1)}.log`;
+}
+
+const SAFE_PANE_LOG_PATH = /^\/[A-Za-z0-9._/-]{0,511}$/;
+
+export function isSafePaneLogPath(value: string): boolean {
+  return (
+    typeof value === "string" && SAFE_PANE_LOG_PATH.test(value) && !value.split("/").includes("..")
+  );
+}
+
+/** Single-quote for `/bin/sh`; tmux hands a pipe command to a shell. */
+function quoteForSh(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Arm the change signal. `-o` replaces the pipe if one is already running
+ * instead of failing, and the `mkdir -p` runs inside the namespace so the log
+ * directory never has to be created from outside (which is impossible anyway).
+ */
+export function pipePaneCmd(paneId: string, path: string): string[] {
+  const slash = path.lastIndexOf("/");
+  const dir = slash > 0 ? path.slice(0, slash) : "/";
+  return ["pipe-pane", "-t", paneId, "-o", `mkdir -p ${quoteForSh(dir)} && cat >> ${quoteForSh(path)}`];
+}
+
+/** No command: tmux closes the pane's pipe. */
+export function pipePaneStopCmd(paneId: string): string[] {
+  return ["pipe-pane", "-t", paneId];
+}
+
+/**
+ * One `/bin/sh -c` body printing `<name> <bytes>` for every log in the
+ * directory. It has to be a single command: the namespace exec round-trip, not
+ * `wc`, is what a poll costs, so a per-pane listing would multiply the very
+ * thing the change signal exists to avoid. A missing directory prints nothing
+ * rather than failing — the first tick arms the pipes and has no logs yet.
+ */
+export function paneLogSizesScript(dir: string): string {
+  return (
+    `cd ${quoteForSh(dir)} 2>/dev/null || exit 0\n` +
+    `for f in *.log; do [ -f "$f" ] || continue; ` +
+    `printf '%s %s\\n' "$f" "$(wc -c < "$f" | tr -d ' ')"; done`
+  );
+}
+
+/** Non-greedy name: `wc` pads the count, and the padding must not end up in the name. */
+const PANE_LOG_SIZE_LINE = /^(.+?)\s+([0-9]{1,18})$/;
+
+/**
+ * `<sessionName>.<pane>.log 4096` → `{ "%<pane>": 4096 }`.
+ *
+ * Keyed by pane id alone: pane ids are unique inside a tmux server, and the
+ * sizes are only ever compared against the panes of the one session the caller
+ * listed. Two sessions on two *different* servers in one namespace could share
+ * an id, and then the worst case is a spurious extra capture — never a missed
+ * one, because a pane with no entry counts as changed. Unparseable lines are
+ * dropped and nothing throws: a poll that cannot read the directory must still
+ * return the screens it can capture.
+ */
+export function parsePaneLogSizes(stdout: string): Record<string, number> {
+  const sizes: Record<string, number> = {};
+  if (typeof stdout !== "string") return sizes;
+  for (const line of stdout.split("\n")) {
+    const match = PANE_LOG_SIZE_LINE.exec(line.trim());
+    if (!match) continue;
+    const name = (match[1] ?? "").trim().replace(/\.log$/, "");
+    const dot = name.lastIndexOf(".");
+    if (dot < 0) continue;
+    const pane = name.slice(dot + 1);
+    if (!/^[0-9]{1,9}$/.test(pane)) continue;
+    const size = Number.parseInt(match[2] ?? "", 10);
+    if (!Number.isSafeInteger(size)) continue;
+    sizes[`%${pane}`] = size;
+  }
+  return sizes;
+}
+
+/**
+ * Which panes are worth a capture. Pure, so the three rules that matter are
+ * testable without a tmux server:
+ *
+ * - size differs from the previous tick → the pane produced output;
+ * - no previous entry → first tick, the panel must fill immediately rather than
+ *   wait for the next change;
+ * - no size at all → the log is missing (pipe just armed, /tmp cleaned, pane
+ *   recreated), so the pane is unknown and must be re-read.
+ */
+export function selectChangedPanes(
+  panes: readonly { paneId: string }[],
+  sizes: Record<string, number>,
+  previous: Record<string, number>,
+): string[] {
+  const changed: string[] = [];
+  for (const pane of panes ?? []) {
+    const paneId = pane?.paneId;
+    if (typeof paneId !== "string" || !isSafePaneId(paneId)) continue;
+    const current = sizes?.[paneId];
+    const before = previous?.[paneId];
+    if (current === undefined || before === undefined || current !== before) changed.push(paneId);
+  }
+  return changed;
+}
+
 /**
  * Literal text: `-l` stops tmux from interpreting the payload as key names, so
  * shell metacharacters reach the pane as characters.
@@ -799,6 +945,28 @@ export class TmuxClient {
       return { ok: false, stdout: "", stderr: `unsafe pane id: ${paneId}` };
     }
     return this.run(capturePaneCmd(paneId, lines));
+  }
+
+  /**
+   * Arm `pipe-pane` for one pane. tmux keeps the pipe on the pane rather than in
+   * this process, so the caller arms once per pane and only re-arms when the log
+   * disappears.
+   */
+  async pipePane(paneId: string, path: string): Promise<TmuxRunResult> {
+    if (!isSafePaneId(paneId)) {
+      return { ok: false, stdout: "", stderr: `unsafe pane id: ${paneId}` };
+    }
+    if (!isSafePaneLogPath(path)) {
+      return { ok: false, stdout: "", stderr: `unsafe pipe log path: ${path}` };
+    }
+    return this.run(pipePaneCmd(paneId, path));
+  }
+
+  async stopPipePane(paneId: string): Promise<TmuxRunResult> {
+    if (!isSafePaneId(paneId)) {
+      return { ok: false, stdout: "", stderr: `unsafe pane id: ${paneId}` };
+    }
+    return this.run(pipePaneStopCmd(paneId));
   }
 
   async selectPane(paneId: string): Promise<TmuxRunResult> {

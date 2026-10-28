@@ -16,6 +16,7 @@ import {
   openAttachTerminalRpc,
   selectPaneRpc,
   sendKeysRpc,
+  streamPanesRpc,
   type TmuxPaneDto,
 } from "../shared/contracts.ts";
 import {
@@ -42,7 +43,14 @@ interface Snapshot {
   detail?: string;
 }
 
-const POLL_INTERVAL_MS = 2000;
+/**
+ * Structural poll: session inventory, pane list, tmux availability. Pane
+ * *content* does not come from here — it comes from the faster `streamPanesRpc`
+ * tick below, which is what makes the panel near-live instead of a 2s snapshot.
+ */
+const STRUCTURAL_POLL_INTERVAL_MS = 2000;
+/** Used until the settings document is read; mirrors the schema default. */
+const FALLBACK_LIVE_POLL_MS = 600;
 const FALLBACK_CAPTURE_LINES = 15;
 /** A full-size tab has the room; do not hold it to the explorer's 15 lines. */
 const WIDE_CAPTURE_LINES = 48;
@@ -121,10 +129,15 @@ function AnsiScreen({
 }
 
 /**
- * Read-only view of the current agent's tmux session: pane inventory plus the
- * last screen lines of each pane, with focus/kill/attach actions. Polling is
- * paused while the panel is unmounted, and a missing session renders as a
- * plain message rather than an error.
+ * View of the current agent's tmux session: pane inventory plus the last screen
+ * lines of each pane, with focus/kill/attach actions.
+ *
+ * Two clocks. Pane content streams on `livePollMs` through `streamPanesRpc`,
+ * which only returns text for panes whose `pipe-pane` log grew, so the panel is
+ * near-live without paying a `capture-pane` for every pane on every tick. The
+ * inventory (panes, session, tmux availability) refreshes on the slower 2s
+ * structural clock, and the Refresh button forces a full capture of everything.
+ * A missing session renders as a plain message rather than an error.
  */
 export function TmuxPanel({ theme, layout, params }: PluginAgentPanelProps) {
   return <TmuxPanelBody theme={theme} layout={layout} agentId={params.agentId} />;
@@ -141,6 +154,7 @@ function TmuxPanelBody({
 }) {
   const callListPanes = useRpc(listPanesRpc);
   const callCapturePane = useRpc(capturePaneRpc);
+  const callStreamPanes = useRpc(streamPanesRpc);
   const callSelectPane = useRpc(selectPaneRpc);
   const callKillPane = useRpc(killPaneRpc);
   const callOpenTerminal = useRpc(openAttachTerminalRpc);
@@ -155,9 +169,20 @@ function TmuxPanelBody({
   const [detailPane, setDetailPane] = useState<{ paneId: string; text: string } | null>(null);
   const [draft, setDraft] = useState<Record<string, string>>({});
   const inFlight = useRef(false);
+  const structuralInFlight = useRef(false);
+  const streamInFlight = useRef(false);
+  /** False while the panel sits in a hidden tab, so the stream idles. */
+  const visible = useRef(true);
+  /**
+   * The content tick that is running, or null when nothing streams — hidden
+   * panel, no session, no tmux, or a stream call that failed. This is what the
+   * header's `live` / `paused` indicator reads.
+   */
+  const [liveMs, setLiveMs] = useState<number | null>(null);
 
   const settingLines =
     settings.status === "ready" ? settings.values.paneCaptureLines : FALLBACK_CAPTURE_LINES;
+  const livePollMs = settings.status === "ready" ? settings.values.livePollMs : FALLBACK_LIVE_POLL_MS;
   // The explorer pane is narrow and short; a workspace tab is not. Ask tmux for
   // more history only when there is room to show it.
   const captureLines = layout.compact ? settingLines : Math.max(settingLines, WIDE_CAPTURE_LINES);
@@ -176,6 +201,65 @@ function TmuxPanelBody({
     [layout.compact, palette.defaultFg],
   );
 
+  /**
+   * Inventory only: which panes exist, whether the session and tmux are there.
+   * Screens are left to the stream so a slow capture never delays the poll.
+   */
+  const refreshStructure = useCallback(async () => {
+    if (structuralInFlight.current) return;
+    structuralInFlight.current = true;
+    try {
+      const result = await callListPanes({ agentId });
+      setSnapshot(result);
+      setError(null);
+      if (!result.exists) {
+        setCaptures({});
+        return;
+      }
+      // A pane that is gone must not keep painting a stale screen.
+      const live = new Set(result.panes.map((pane) => pane.paneId));
+      setCaptures((current) => {
+        const kept = Object.fromEntries(
+          Object.entries(current).filter(([paneId]) => live.has(paneId)),
+        );
+        return Object.keys(kept).length === Object.keys(current).length ? current : kept;
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      structuralInFlight.current = false;
+    }
+  }, [agentId, callListPanes]);
+
+  /**
+   * Fast content tick. The server reports only the panes whose pipe log grew, so
+   * an unchanged pane costs one small object on the wire and no repaint here.
+   */
+  const streamContent = useCallback(async () => {
+    if (streamInFlight.current || !visible.current) return;
+    streamInFlight.current = true;
+    try {
+      const result = await callStreamPanes({ agentId, lines: captureLines });
+      setLiveMs(livePollMs);
+      setCaptures((current) => {
+        let next = current;
+        for (const pane of result.panes) {
+          if (!pane.changed) continue;
+          if (next === current) next = { ...current };
+          next[pane.paneId] = pane.text;
+        }
+        return next;
+      });
+    } catch {
+      // A dropped tick must not blank the panel: keep the last screens and say
+      // `paused` until the stream comes back.
+      setLiveMs(null);
+    } finally {
+      streamInFlight.current = false;
+    }
+  }, [agentId, callStreamPanes, captureLines, livePollMs]);
+
+  /** Full snapshot: inventory plus a forced capture of every pane. */
   const refresh = useCallback(async () => {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -207,10 +291,42 @@ function TmuxPanelBody({
   }, [agentId, callCapturePane, callListPanes, captureLines]);
 
   useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    void refreshStructure();
+    const timer = setInterval(() => void refreshStructure(), STRUCTURAL_POLL_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [refreshStructure]);
+
+  /**
+   * Content polls on their own, faster clock. Streaming stops when the panel
+   * already knows there is nothing to poll (no tmux, no session) — that is the
+   * `paused` case the header shows — and restarts as soon as either returns.
+   * The deps are the two booleans rather than the snapshot object so the 2s
+   * structural refresh does not tear this interval down every time.
+   */
+  useEffect(() => {
+    if (snapshot !== null && (!snapshot.tmuxAvailable || !snapshot.exists)) {
+      setLiveMs(null);
+      return;
+    }
+    void streamContent();
+    const timer = setInterval(() => void streamContent(), livePollMs);
+    return () => {
+      clearInterval(timer);
+      setLiveMs(null);
+    };
+  }, [livePollMs, snapshot?.exists, snapshot?.tmuxAvailable, streamContent]);
+
+  // A panel in a background tab or a hidden window should not pay for a poll.
+  // Guarded because the panel runs wherever the host renders it.
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof document.addEventListener !== "function") return;
+    const onVisibility = () => {
+      visible.current = document.visibilityState !== "hidden";
+      if (!visible.current) setLiveMs(null);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
 
   const runAction = useCallback(
     async (key: string, action: () => Promise<void>, done: string) => {
@@ -353,6 +469,7 @@ function TmuxPanelBody({
         backgroundColor: theme.colors.surface2,
       },
       buttonText: { color: theme.colors.foreground, fontSize: 12 },
+      live: { color: theme.colors.statusSuccess, fontSize: 12 },
       primary: { backgroundColor: theme.colors.accent },
       primaryText: { color: theme.colors.accentForeground, fontSize: 12 },
       danger: { color: theme.colors.statusDanger, fontSize: 12 },
@@ -393,6 +510,9 @@ function TmuxPanelBody({
             : `${panes.length} pane${panes.length === 1 ? "" : "s"}` +
               (snapshot?.tmuxExecLabel ? ` · ${snapshot.tmuxExecLabel}` : "") +
               (snapshot?.tmuxPath ? ` · ${snapshot.tmuxPath}` : "")}
+        </Text>
+        <Text style={liveMs === null ? styles.muted : styles.live}>
+          {liveMs === null ? "paused" : `live · ${liveMs}ms`}
         </Text>
       </View>
 

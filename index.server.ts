@@ -13,6 +13,7 @@ import {
   selectPaneRpc,
   sendKeysRpc,
   sessionStatusRpc,
+  streamPanesRpc,
 } from "./shared/contracts.ts";
 import type { BridgeSettings } from "./shared/contracts.ts";
 import { sanitizeCapture } from "./shared/ansi.ts";
@@ -40,11 +41,16 @@ import {
   execLabel,
   isOwnSessionName,
   isPiProviderId,
+  paneLogDir,
+  paneLogPath,
+  paneLogSizesScript,
   parsePathLookup,
+  parsePaneLogSizes,
   pathBaseFor,
   resolveExecPrefix,
   resolvePlaceholderCommand,
   resolveTmuxPath,
+  selectChangedPanes,
   sessionNameFor,
   shouldHandleSessionOpen,
   shellProbeInvocation,
@@ -113,6 +119,30 @@ export default function contribute(server: PluginServerContext): () => void {
   }
   const targets = new Map<string, TmuxTarget>();
   const targetsInFlight = new Map<string, Promise<TmuxTarget>>();
+  /**
+   * Streaming state for `stream-panes`.
+   *
+   * `paneLogSizes` is the change signal: the byte size each pane's pipe log had
+   * at the end of the previous tick. The two sets exist because tmux keeps a
+   * pipe on the **pane**, not in this process: arming `pipe-pane` again would
+   * kill and restart the pipe's shell, so each pane is armed once per plugin
+   * instance, and a pane whose log went missing is re-armed at most once more.
+   *
+   * Keys are `<agentId>|<paneId>`; `|` is not in the agent-id character class,
+   * so the separator cannot be forged and cleanup can match a whole agent.
+   */
+  const paneLogSizes = new Map<string, Record<string, number>>();
+  const panePipesArmed = new Set<string>();
+  const panePipesRearmed = new Set<string>();
+
+  function clearPaneStreamState(agentId: string): void {
+    paneLogSizes.delete(agentId);
+    const prefixKey = `${agentId}|`;
+    for (const armed of panePipesArmed) if (armed.startsWith(prefixKey)) panePipesArmed.delete(armed);
+    for (const armed of panePipesRearmed) {
+      if (armed.startsWith(prefixKey)) panePipesRearmed.delete(armed);
+    }
+  }
   const settingsHandle = server.registerSettings(bridgeSettings);
 
   // `schema.parse({})` yields the declared defaults, so there is one source of
@@ -670,6 +700,10 @@ export default function contribute(server: PluginServerContext): () => void {
     if (stopped) return;
     if (cleanedUp.has(agentId)) return;
     cleanedUp.add(agentId);
+    // The panes are going away, so their sizes and pipe bookkeeping are stale.
+    // No `stopPipe-pane` is needed: the pipe dies with the pane, and a session
+    // kept alive by `killOnClose: false` gets its pipes re-armed on -o.
+    clearPaneStreamState(agentId);
     try {
       const settings = await currentSettings();
       const record = bookkeeping.get(agentId);
@@ -869,18 +903,182 @@ export default function contribute(server: PluginServerContext): () => void {
     if (!panes.some((pane) => pane.paneId === input.paneId)) {
       return { paneId: input.paneId, text: "", lines: 0, detail: "pane is not in this agent's session" };
     }
-    const result = await tmux.capturePane(input.paneId, input.lines ?? settings.paneCaptureLines);
-    if (!result.ok) return { paneId: input.paneId, text: "", lines: 0, detail: result.stderr };
-    // `-e` keeps colours; everything that is not an SGR sequence is dropped here
-    // so the client never has to defend against cursor/OSC junk.
+    const captured = await captureBody(tmux, input.paneId, input.lines ?? settings.paneCaptureLines);
+    return { paneId: input.paneId, ...captured };
+  });
+
+  /**
+   * One pane's screen, sanitised the same way for the snapshot RPC and the
+   * streaming RPC: `-e` keeps colours, everything that is not an SGR sequence is
+   * dropped server-side so the client never has to defend against cursor/OSC
+   * junk.
+   */
+  async function captureBody(
+    tmux: TmuxClientType,
+    paneId: string,
+    lines: number,
+  ): Promise<{ text: string; lines: number; detail?: string }> {
+    const result = await tmux.capturePane(paneId, lines);
+    if (!result.ok) return { text: "", lines: 0, detail: result.stderr };
     const captured = sanitizeCapture(result.stdout);
     const body = captured.text.replace(/\s+$/u, "");
     return {
-      paneId: input.paneId,
       text: body,
       lines: body.length === 0 ? 0 : body.split("\n").length,
       ...(captured.truncated ? { detail: "capture truncated" } : {}),
     };
+  }
+
+  /**
+   * Near-live panes. `pipe-pane` byte growth decides **which** panes are worth a
+   * capture; `capture-pane -p -e` stays the renderer, because the pipe stream
+   * carries keystroke echo and CRs and would need a full terminal emulator.
+   *
+   * Cost per tick: one pane listing, one `/bin/sh` listing of the log directory,
+   * and captures only for panes whose log grew. Every step is fail-soft: a tmux
+   * or exec failure returns whatever was collected, never throws, and a pane the
+   * server knows nothing about is reported as changed so the panel keeps the
+   * last screen it had rather than blanking.
+   */
+  server.handle(streamPanesRpc, async (input) => {
+    const problems: string[] = [];
+    try {
+      const { settings, name } = await sessionFor(input.agentId);
+      if (!name) {
+        return {
+          agentId: input.agentId,
+          sessionName: "",
+          exists: false,
+          tmuxAvailable: false,
+          panes: [],
+          detail: "agent id is not usable as a tmux session name",
+        };
+      }
+      const { target, values, tmux } = await clientForAgent(input.agentId, name);
+      if (!target.path) {
+        return {
+          agentId: input.agentId,
+          sessionName: name,
+          exists: false,
+          tmuxAvailable: false,
+          panes: [],
+          detail: TMUX_MISSING_DETAIL,
+        };
+      }
+      const logDir = paneLogDir(settings.sessionPrefix);
+      if (!logDir) {
+        return {
+          agentId: input.agentId,
+          sessionName: name,
+          exists: false,
+          tmuxAvailable: true,
+          panes: [],
+          detail: "session prefix is not usable as a pipe log path",
+        };
+      }
+      const exists = await tmux.sessionExists(name);
+      if (!exists) {
+        // Gone: forget the baseline so a replacement session fills the panel on
+        // its first tick instead of being compared against a dead pane's log.
+        clearPaneStreamState(input.agentId);
+        return { agentId: input.agentId, sessionName: name, exists: false, tmuxAvailable: true, panes: [] };
+      }
+      // The pane set comes from this agent's session, which is the ownership
+      // guard the single-pane RPCs have to do by hand.
+      const panes = await tmux.listPanes(name);
+
+      // Panes armed by *this* call: measured on tmux 3.6, the log file does not
+      // exist yet in the listing taken moments later, because the pipe's shell
+      // has to start before its `>>` redirect opens.
+      const armedNow = new Set<string>();
+      for (const pane of panes) {
+        const key = `${input.agentId}|${pane.paneId}`;
+        if (panePipesArmed.has(key)) continue;
+        const path = paneLogPath(name, pane.paneId);
+        if (!path) continue;
+        const armed = await tmux.pipePane(pane.paneId, path);
+        if (armed.ok) {
+          panePipesArmed.add(key);
+          armedNow.add(key);
+        } else problems.push(`pipe-pane ${pane.paneId}: ${armed.stderr || "failed"}`);
+      }
+
+      const listing = await execThrough(
+        applyExecPlaceholders(target.prefix, values),
+        "/bin/sh",
+        ["-c", paneLogSizesScript(logDir)],
+        // A poll must not hold the tick open for the usual 15s exec deadline.
+        { timeout: 5000 },
+      );
+      const sizes = listing.ok ? parsePaneLogSizes(listing.stdout) : null;
+      if (!sizes) problems.push(`pipe log listing: ${listing.stderr || "failed"}`);
+      const previous = paneLogSizes.get(input.agentId) ?? {};
+      // A failed listing proves nothing, so this tick captures everything (the
+      // old behaviour) but keeps the last good baseline for the next one.
+      const changed = new Set(selectChangedPanes(panes, sizes ?? {}, previous));
+      const lines = input.lines ?? settings.paneCaptureLines;
+
+      const captured = await Promise.all(
+        panes.map(async (pane) => {
+          const key = `${input.agentId}|${pane.paneId}`;
+          // "piping" is only claimed when the log is actually there; a failed
+          // listing cannot prove either way, so an armed pipe is assumed.
+          const piping =
+            panePipesArmed.has(key) &&
+            (armedNow.has(key) || sizes === null || sizes[pane.paneId] !== undefined);
+          if (!changed.has(pane.paneId)) {
+            return { paneId: pane.paneId, changed: false, text: "", lines: 0, piping };
+          }
+          const body = await captureBody(tmux, pane.paneId, lines);
+          if (body.detail) problems.push(`${pane.paneId}: ${body.detail}`);
+          return { paneId: pane.paneId, changed: true, text: body.text, lines: body.lines, piping };
+        }),
+      );
+
+      if (sizes) {
+        for (const pane of panes) {
+          const key = `${input.agentId}|${pane.paneId}`;
+          if (!panePipesArmed.has(key) || armedNow.has(key)) continue;
+          if (sizes[pane.paneId] !== undefined) continue;
+          // The log is missing for a pane armed on an earlier tick: the pane was
+          // recreated, /tmp was cleared, or tmux dropped the pipe. Re-arm exactly
+          // once per pane per plugin instance — a pane that will not produce a
+          // log must not be re-armed every tick. A pane armed in *this* tick has
+          // not had time to create its file yet, so it is not a loss.
+          if (panePipesRearmed.has(key)) continue;
+          panePipesRearmed.add(key);
+          const path = paneLogPath(name, pane.paneId);
+          if (!path) continue;
+          const again = await tmux.pipePane(pane.paneId, path);
+          if (!again.ok) problems.push(`re-arm ${pane.paneId}: ${again.stderr || "failed"}`);
+        }
+        const next: Record<string, number> = {};
+        for (const pane of panes) {
+          const size = sizes[pane.paneId];
+          if (size !== undefined) next[pane.paneId] = size;
+        }
+        paneLogSizes.set(input.agentId, next);
+      }
+
+      return {
+        agentId: input.agentId,
+        sessionName: name,
+        exists: true,
+        tmuxAvailable: true,
+        panes: captured,
+        ...(problems.length > 0 ? { detail: problems.join("; ") } : {}),
+      };
+    } catch (error) {
+      // Never throw out of a poll the client runs several times a second.
+      return {
+        agentId: input.agentId,
+        sessionName: "",
+        exists: false,
+        tmuxAvailable: false,
+        panes: [],
+        detail: `stream-panes failed: ${describeError(error)}`,
+      };
+    }
   });
 
   server.handle(selectPaneRpc, async (input) => {
@@ -1005,5 +1203,8 @@ export default function contribute(server: PluginServerContext): () => void {
     offClosed();
     offArchived();
     bookkeeping.clear();
+    paneLogSizes.clear();
+    panePipesArmed.clear();
+    panePipesRearmed.clear();
   };
 }

@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   AMOS_IDENTITY_ENV_KEYS,
@@ -39,12 +43,20 @@ import {
   parseServerPid,
   parseSocketPath,
   pathBaseFor,
+  PANE_LOG_ROOT,
+  paneLogDir,
+  paneLogPath,
+  paneLogSizesScript,
+  parsePaneLogSizes,
+  pipePaneCmd,
+  pipePaneStopCmd,
   prependToPath,
   binaryDirOf,
   resolveExecPrefix,
   resolvePlaceholderCommand,
   resolveTmuxPath,
   shellProbeInvocation,
+  selectChangedPanes,
   selectLayoutCmd,
   selectPaneCmd,
   sendKeyCmd,
@@ -976,4 +988,104 @@ test("the resolution probe and the agent-PATH probe are different on purpose", (
   assert.deepEqual(TMUX_REACHABLE_ARGS, ["-c", "command -v tmux"]);
   assert.notDeepEqual(TMUX_REACHABLE_ARGS, TMUX_WHICH_ARGS);
   assert.equal(tmuxDirToInject({ path: "/usr/bin/tmux", reachableInPath: undefined }), null);
+});
+
+// ── pipe-pane change signal (stream-panes) ─────────────────────────────────
+
+test("pipe log paths are deterministic inside the namespace", () => {
+  assert.equal(paneLogDir("paseo-"), PANE_LOG_ROOT);
+  // The daemon cannot read a file the container created, so the path is only
+  // ever used through the exec prefix; it still has to be predictable.
+  assert.equal(paneLogPath("paseo-a7", "%12"), "/tmp/pi-tmux-bridge/paseo-a7.12.log");
+  assert.equal(paneLogPath("paseo-a.b:c-d", "%1"), "/tmp/pi-tmux-bridge/paseo-a.b:c-d.1.log");
+});
+
+test("pipe log paths reject hostile session and pane names", () => {
+  // The pane id lands in a tmux `-t` slot and the path in a shell command, so
+  // neither may carry a separator, a metacharacter or a traversal.
+  assert.equal(paneLogPath("paseo-a7", "%1;kill-server"), "");
+  assert.equal(paneLogPath("paseo-a7", "%"), "");
+  assert.equal(paneLogPath("paseo-a7", "1"), "");
+  assert.equal(paneLogPath("paseo-../escape", "%1"), "");
+  assert.equal(paneLogPath("", "%1"), "");
+  assert.equal(paneLogDir(""), "");
+  assert.equal(paneLogDir("paseo-; rm -rf /"), "");
+});
+
+test("pipe-pane argv arms a shell that creates its own log directory", () => {
+  const path = paneLogPath("paseo-a7", "%3");
+  // `-o` replaces an existing pipe instead of failing, and `mkdir -p` runs
+  // inside the namespace where the log has to live.
+  assert.deepEqual(pipePaneCmd("%3", path), [
+    "pipe-pane",
+    "-t",
+    "%3",
+    "-o",
+    "mkdir -p '/tmp/pi-tmux-bridge' && cat >> '/tmp/pi-tmux-bridge/paseo-a7.3.log'",
+  ]);
+  // No command = tmux closes the pipe.
+  assert.deepEqual(pipePaneStopCmd("%3"), ["pipe-pane", "-t", "%3"]);
+});
+
+test("the tmux client guards pipe-pane before any exec", async () => {
+  const { run, calls } = fakeTmux([]);
+  const client = new TmuxClient(run);
+  assert.equal((await client.pipePane("%1;kill-server", paneLogPath("paseo-a7", "%1"))).ok, false);
+  assert.equal((await client.pipePane("%1", "/tmp/../etc/passwd.log")).ok, false);
+  assert.equal((await client.pipePane("%1", "")).ok, false);
+  assert.equal((await client.stopPipePane("%1;kill-server")).ok, false);
+  assert.deepEqual(calls, [], "the guard must run before the exec");
+  assert.equal((await client.pipePane("%1", paneLogPath("paseo-a7", "%1"))).ok, true);
+  assert.deepEqual(calls[0], pipePaneCmd("%1", paneLogPath("paseo-a7", "%1")));
+});
+
+test("the size listing really lists every log in one shell call", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-tmux-bridge-test-"));
+  try {
+    writeFileSync(join(dir, "paseo-a7.1.log"), "hello");
+    writeFileSync(join(dir, "paseo-a7.12.log"), "");
+    writeFileSync(join(dir, "ignore-me.txt"), "not a pane log");
+    const stdout = execFileSync("/bin/sh", ["-c", paneLogSizesScript(dir)], { encoding: "utf8" });
+    assert.deepEqual(parsePaneLogSizes(stdout), { "%1": 5, "%12": 0 });
+    // The first tick arms the pipes, so the directory may not exist yet: the
+    // listing must print nothing and still exit 0.
+    const quiet = execFileSync(
+      "/bin/sh",
+      ["-c", paneLogSizesScript(join(dir, "not-created-yet"))],
+      { encoding: "utf8" },
+    );
+    assert.equal(quiet.trim(), "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the size listing parser takes what it can and never throws", () => {
+  assert.deepEqual(parsePaneLogSizes("paseo-a7.1.log 4096\npaseo-a7.12.log 0\n"), {
+    "%1": 4096,
+    "%12": 0,
+  });
+  // wc pads the count on some platforms, and a session name may contain dots.
+  assert.deepEqual(parsePaneLogSizes("paseo-a.b.3.log      17"), { "%3": 17 });
+  assert.deepEqual(parsePaneLogSizes(""), {});
+  assert.deepEqual(parsePaneLogSizes(undefined as unknown as string), {});
+  // An unmatched glob, a stray word, and junk that is not a pane log.
+  assert.deepEqual(parsePaneLogSizes("*.log 0\ntotal 42\nnot-a-pane.log 12\nno space here\n"), {});
+});
+
+test("a pane is changed when its log grows, is new, or is missing", () => {
+  const panes = [{ paneId: "%1" }, { paneId: "%2" }, { paneId: "%3" }];
+  const sizes = { "%1": 10, "%2": 20, "%3": 30 };
+  // First tick has no baseline, so the panel fills now instead of after the
+  // next piece of output.
+  assert.deepEqual(selectChangedPanes(panes, sizes, {}), ["%1", "%2", "%3"]);
+  assert.deepEqual(selectChangedPanes(panes, sizes, sizes), []);
+  assert.deepEqual(selectChangedPanes(panes, { ...sizes, "%1": 11 }, sizes), ["%1"]);
+  // A shrink is a change too: the log was truncated or recreated.
+  assert.deepEqual(selectChangedPanes(panes, { ...sizes, "%2": 19 }, sizes), ["%2"]);
+  // Missing log = pipe just armed, /tmp cleared, or pane recreated: unknown, so
+  // re-read rather than assume the screen is still current.
+  assert.deepEqual(selectChangedPanes(panes, { "%1": 10, "%2": 20 }, sizes), ["%3"]);
+  // A pane id that is not a pane id never reaches tmux.
+  assert.deepEqual(selectChangedPanes([{ paneId: "%1;kill-server" }], { "%1": 5 }, {}), []);
 });

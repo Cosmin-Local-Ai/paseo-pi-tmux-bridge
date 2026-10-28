@@ -1062,6 +1062,44 @@ $ tsc --noEmit -p tsconfig.json         → clean
 $ tsx tests/compile-check.mjs           → compile-check: PASS, badContributionIds: []
 ```
 
+## 6. Live panel: the pipe log answers *what changed*, `capture-pane -e` renders
+
+Measured on this machine's tmux 3.6, inside the sandbox namespace:
+
+```bash
+$ tmux list-panes -t <session> -F '#{pane_id} lo=[#{pane_last_output}] ch=[#{pane_changed}] hist=[#{pane_history_lines}]'
+%15 lo=[] ch=[] hist=[]
+```
+
+Every change-detection format tmux offers expands to **empty** here, including on a fresh isolated
+server with a pane that had already drawn output. So "has this pane produced output?" cannot be asked
+of tmux, and the plugin has to observe it: `pipe-pane -o 'mkdir -p … && cat >> …'` per pane, then one
+`/bin/sh -c` listing `name size` for the whole log directory per tick.
+
+Raw-stream replay was rejected on evidence, not taste. The first bytes a pipe log received were the
+keystroke echo of the command itself:
+
+```
+printf "\033[32mGREEN\033[0m live\n"^M
+```
+
+That is a terminal feed, not a screen. Faithful replay needs a screen model; Paseo owns one
+(`packages/app/src/terminal/runtime/terminal-emulator-runtime`) and it is not importable from a plugin
+bundle (`tests/compile-check.mjs` enforces the SDK boundary). Capturing the pane keeps the colours and
+the layout correct, and is only paid for on panes that changed.
+
+One race, measured rather than assumed: after `pipe-pane` returns, the log file does **not** exist yet
+in a listing taken moments later, because the pipe's shell has to start before its `>>` redirect opens.
+The handler tracks panes armed in the current tick separately, and re-arms a vanished log at most once
+per pane per plugin instance, so a pane that will never produce a log is not re-armed every tick.
+
+Verified end-to-end against the live tmux 3.6 in the container: first tick reports every pane changed
+(no baseline), pane output grows the log 0 → 28 bytes, next tick reports that pane changed and captures
+it, an idle tick captures nothing. `stream-panes` registers on both sides of the wire (the compile
+check derives the expected RPC names from `shared/contracts.ts`, so a one-sided registration fails).
+
+tests 86 pass (64 unit, 22 ansi) · Paseo plugin compiler PASS · `tsc --noEmit` clean.
+
 ## Still not proven
 
 Real `sbx`/containerd sandbox (the harness is `unshare`+`nsenter`, not their runtime); `agent.closed`

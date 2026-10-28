@@ -139,6 +139,34 @@ pane must belong to that agent's session, and named keys are limited to an allow
 
 Then just ask the agent to use the `subagent` tool as you would inside tmux.
 
+## How live the panel is
+
+The panel is not a video feed and it is not a terminal emulator either. It works as a
+change-signal loop, which keeps the rendering honest:
+
+1. For every pane the plugin arms `tmux pipe-pane -t <pane> -o 'mkdir -p … && cat >> …'`, so tmux
+   appends that pane's output to a log **inside the agent's namespace**
+   (`/tmp/pi-tmux-bridge/<session>.<pane>.log`).
+2. Each tick costs one exec: a single `/bin/sh -c` lists `name size` for every log in that directory.
+   The daemon cannot read container files directly, so this goes through the same exec prefix as tmux.
+3. `selectChangedPanes` compares sizes against the last good baseline. Only panes that actually
+   produced output (or have no baseline yet, or lost their log) are re-captured with
+   `capture-pane -p -e`; everything else returns `changed: false` and is not repainted.
+4. The header says `live · 600ms`, or `paused` when the tab is hidden, there is no session, tmux is
+   unavailable, or a tick failed.
+
+Why not replay the pipe log directly? Because on tmux 3.6 that stream is the raw feed — keystroke
+echo, `^M`, cursor addressing. Rendering it faithfully needs a screen model; Paseo has one
+(`packages/app/src/terminal/runtime/terminal-emulator-runtime`) and plugins cannot import it. So the
+pipe log answers *did anything change*, and `capture-pane -e` remains the renderer, which is also what
+keeps the colours correct.
+
+Change detection cannot use tmux formats here: `pane_last_output`, `pane_changed`, `pane_history_lines`
+and `pane_output_size` all expand to **empty** on this tmux 3.6 build, which is why the pipe log exists.
+
+The logs hold pane text, so they can contain anything the agent printed. They live inside the sandbox,
+under `/tmp/pi-tmux-bridge/`, and die with the session.
+
 ## Settings
 
 `paseo daemon config` / the **Pi tmux bridge** settings screen:
@@ -156,6 +184,7 @@ Then just ask the agent to use the `subagent` tool as you would inside tmux.
 | `autoAttachTerminal` | `true` | open the attach terminal automatically |
 | `killOnClose` | `true` | kill the session on close/archive |
 | `paneCaptureLines` | `15` | capture depth in the panel |
+| `livePollMs` | `600` | how often the panel asks whether a pane produced output (200-10000) |
 | `autoDetectPiProviders` | `true` | treat `pi`-derived provider ids (`pi-recovery`, …) as Pi |
 | `piProviders` | `[]` | exact extra provider ids to treat as Pi |
 | `stripAmosIdentity` | `true` | drop inherited `PI_SUBAGENT_*` vars from the agent env |

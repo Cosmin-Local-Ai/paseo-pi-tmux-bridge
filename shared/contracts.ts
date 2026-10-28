@@ -74,6 +74,13 @@ export const bridgeSettings = defineSettings({
     stripAmosIdentity: z.boolean().default(true),
     killOnClose: z.boolean().default(true),
     paneCaptureLines: z.number().int().min(1).max(500).default(15),
+    /**
+     * How often the panel asks the server "did any pane produce output?". The
+     * ask is one pane listing plus one `wc -c` of the pipe-log directory, so it
+     * is cheap enough to run far faster than the old 2s screen poll; a capture
+     * is only paid for panes whose pipe log actually grew.
+     */
+    livePollMs: z.number().int().min(200).max(10000).default(600),
   }),
 });
 
@@ -163,6 +170,42 @@ export const capturePaneRpc = defineRpc({
     detail: z.string().optional(),
   }),
 });
+
+/**
+ * Near-live pane content. The server arms `tmux pipe-pane` per pane and uses the
+ * growth of those log files as a **change signal**, while the text itself still
+ * comes from `capture-pane -p -e` (the pipe stream carries keystroke echo and
+ * CRs, so it is not renderable). Unchanged panes come back with `changed:false`
+ * and empty text so the client can skip repainting them.
+ */
+export const streamPanesRpc = defineRpc({
+  name: "stream-panes",
+  input: z.object({
+    agentId: agentIdSchema,
+    lines: z.number().int().min(1).max(500).optional(),
+  }),
+  output: z.object({
+    agentId: z.string(),
+    sessionName: z.string(),
+    exists: z.boolean(),
+    tmuxAvailable: z.boolean(),
+    panes: z.array(
+      z.object({
+        paneId: z.string(),
+        /** False = the pane's pipe log did not grow since the last call. */
+        changed: z.boolean(),
+        /** Screen text; empty unless `changed` is true. */
+        text: z.string(),
+        lines: z.number().int().min(0),
+        /** Whether this pane's pipe is armed **and** its log is present. */
+        piping: z.boolean(),
+      }),
+    ),
+    detail: z.string().optional(),
+  }),
+});
+
+export type StreamPaneDto = z.output<typeof streamPanesRpc.output>["panes"][number];
 
 export const selectPaneRpc = defineRpc({
   name: "select-pane",

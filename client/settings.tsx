@@ -234,6 +234,13 @@ function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfacePr
           settings={settings}
           onCommit={(paneCaptureLines) => patch({ paneCaptureLines })}
         />
+        <NumberField
+          label="Live poll interval (ms)"
+          hint="How often the panel asks whether a pane produced output. Only panes whose pipe log grew are captured."
+          value={values.livePollMs}
+          settings={settings}
+          onCommit={(livePollMs) => patch({ livePollMs })}
+        />
       </SettingsCard>
       <SettingsRow label="Current values">
         <View>
@@ -243,7 +250,7 @@ function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfacePr
           </Text>
           <Text style={style}>
             placeholder {values.placeholderCmd} · delay {values.shellReadyDelayMs}ms · capture{" "}
-            {values.paneCaptureLines} lines
+            {values.paneCaptureLines} lines · live every {values.livePollMs}ms
           </Text>
           <Text style={style}>
             tmux {values.tmuxPath || "(probed)"} · exec {JSON.stringify(values.tmuxExec)} · per
