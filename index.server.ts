@@ -198,6 +198,46 @@ export default function contribute(server: PluginServerContext): () => void {
    * `tmuxPath`, `command -v tmux`, then the fixed candidate list; each candidate
    * is proven by running `<candidate> -V`.
    */
+  /** One full probe pass through a namespace prefix, under one deadline. */
+  async function probeTmuxTarget(
+    prefix: readonly string[],
+    configured: string,
+    candidates: readonly string[],
+    timeout: number,
+    signal?: AbortSignal,
+  ): Promise<{ path: string | null; tried: string[]; reachableInPath: boolean }> {
+    const which = await execThrough(prefix, "/bin/sh", [...TMUX_WHICH_ARGS], { timeout, signal });
+    const pathLookup = which.ok ? parsePathLookup(which.stdout) : null;
+    // Whether tmux survives in the agent's own PATH is a separate question:
+    // a login shell would answer it wrongly by restoring the profile PATH.
+    const reachable = await execThrough(prefix, "/bin/sh", [...TMUX_REACHABLE_ARGS], {
+      timeout,
+      signal,
+    });
+    const reachableInPath = reachable.ok && parsePathLookup(reachable.stdout) !== null;
+    const usable = new Set<string>();
+    const toProbe =
+      configured.length > 0 ? [configured] : [...(pathLookup ? [pathLookup] : []), ...candidates];
+    for (const candidate of toProbe) {
+      if (usable.has(candidate)) continue;
+      const probed = await execThrough(prefix, candidate, ["-V"], { timeout, signal });
+      if (probed.ok) usable.add(candidate);
+    }
+    const resolved = resolveTmuxPath({ configured, pathLookup, candidates }, (c) =>
+      usable.has(c),
+    );
+    return { path: resolved.path, tried: resolved.tried, reachableInPath };
+  }
+
+  /**
+   * A sandbox that is not running yet has to boot its container before any probe
+   * can answer, and that first boot can outlast a normal deadline. One pass is
+   * therefore not enough: the first agent after a daemon start used to lose that
+   * race, get `TMUX=""`, and have the failure **cached**, so every later agent on
+   * the same provider was blocked too until the daemon reloaded.
+   */
+  const TMUX_PROBE_DEADLINES_MS: readonly number[] = [8000, 25000];
+
   async function resolveTmuxFor(
     provider: string,
     values: PrefixValues,
@@ -218,42 +258,32 @@ export default function contribute(server: PluginServerContext): () => void {
       const label = execLabel(prefix);
       const configured = typeof settings.tmuxPath === "string" ? settings.tmuxPath.trim() : "";
       const candidates = tmuxCandidatePaths(process.env.HOME);
-      const which = await execThrough(prefix, "/bin/sh", [...TMUX_WHICH_ARGS], {
-        timeout: 8000,
-        signal,
-      });
-      const pathLookup = which.ok ? parsePathLookup(which.stdout) : null;
-      // Whether tmux survives in the agent's own PATH is a separate question:
-      // a login shell would answer it wrongly by restoring the profile PATH.
-      const reachable = await execThrough(prefix, "/bin/sh", [...TMUX_REACHABLE_ARGS], {
-        timeout: 8000,
-        signal,
-      });
-      const reachableInPath = reachable.ok && parsePathLookup(reachable.stdout) !== null;
-      const usable = new Set<string>();
-      const toProbe =
-        configured.length > 0 ? [configured] : [...(pathLookup ? [pathLookup] : []), ...candidates];
-      for (const candidate of toProbe) {
-        if (usable.has(candidate)) continue;
-        const probed = await execThrough(prefix, candidate, ["-V"], { timeout: 8000, signal });
-        if (probed.ok) usable.add(candidate);
+      let attempt = 0;
+      let probed = await probeTmuxTarget(prefix, configured, candidates, TMUX_PROBE_DEADLINES_MS[0]!, signal);
+      while (!probed.path && !signal?.aborted && attempt + 1 < TMUX_PROBE_DEADLINES_MS.length) {
+        attempt += 1;
+        log(
+          `tmux probe in ${label} failed on attempt ${attempt}; retrying with a `
+            + `${TMUX_PROBE_DEADLINES_MS[attempt]}ms deadline (cold sandbox?)`,
+        );
+        probed = await probeTmuxTarget(prefix, configured, candidates, TMUX_PROBE_DEADLINES_MS[attempt]!, signal);
       }
-      const resolved = resolveTmuxPath({ configured, pathLookup, candidates }, (c) =>
-        usable.has(c),
-      );
       const target: TmuxTarget = {
         provider,
-        path: resolved.path,
-        tried: resolved.tried,
+        path: probed.path,
+        tried: probed.tried,
         prefix: rawPrefix,
         label,
-        reachableInPath,
+        reachableInPath: probed.reachableInPath,
       };
-      targets.set(provider, target);
+      // Only successes are cached. Caching a miss used to pin a whole provider to
+      // an empty TMUX for the rest of the daemon's life.
+      if (target.path) targets.set(provider, target);
       log(
         target.path
           ? `tmux resolved to ${target.path} (${label})`
-          : `${TMUX_MISSING_DETAIL} (${label}); tried: ${target.tried.join(", ")}`,
+          : `${TMUX_MISSING_DETAIL} (${label}); tried: ${target.tried.join(", ")}. `
+              + `Not cached: the next session open probes again.`,
       );
       return target;
     })().finally(() => {
@@ -894,6 +924,27 @@ export default function contribute(server: PluginServerContext): () => void {
     );
     return { ok: Boolean(terminalId), terminalId, sessionName: name };
   });
+
+  // Warm the namespace probes before any agent needs them, so the first agent of
+  // a daemon's life is not the one that pays for a cold sandbox boot.
+  function warmTargets(): void {
+    const values: PrefixValues = { cwd: process.cwd(), agentId: "warmup" };
+    const providers = new Set<string>([
+      ...Object.keys(defaultSettings.providerTmuxExec ?? {}),
+      ...(defaultSettings.tmuxExec && defaultSettings.tmuxExec.length > 0 ? ["pi"] : []),
+    ]);
+    for (const provider of providers) {
+      void resolveTmuxFor(provider, values)
+        .then((target) => {
+          if (!target.path) log(`warm-up found no tmux for provider ${provider} (${target.label})`);
+        })
+        .catch((error: unknown) => {
+          if (!channelGone(error)) log(`warm-up failed: ${describeError(error)}`);
+        });
+    }
+  }
+
+  warmTargets();
 
   log(
     `ready (prefix=${JSON.stringify(defaultSettings.sessionPrefix)} ` +
