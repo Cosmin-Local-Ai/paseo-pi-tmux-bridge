@@ -337,15 +337,17 @@ export default function contribute(server: PluginServerContext): () => void {
         label,
         reachableInPath: probed.reachableInPath,
       };
-      // Only successes are cached. Caching a miss used to pin a whole provider to
-      // an empty TMUX for the rest of the daemon's life.
+      // Successes are cached for the daemon's life; misses only for a TTL. Caching a
+      // miss forever used to pin a whole provider to an empty TMUX, while not caching
+      // misses at all let a dead namespace cost every single call its full deadline.
       if (target.path) targets.set(provider, target);
       else targetsMiss.set(provider, { target, expiresAt: Date.now() + TARGET_MISS_TTL_MS });
       log(
         target.path
           ? `tmux resolved to ${target.path} (${label})`
           : `${TMUX_MISSING_DETAIL} (${label}); tried: ${target.tried.join(", ")}. `
-              + `Not cached: the next session open probes again.`,
+              + `Cached as missing for ${TARGET_MISS_TTL_MS / 1000}s; the next open inside that `
+              + `window reuses this answer instead of probing again.`,
       );
       return target;
     })().finally(() => {

@@ -656,9 +656,34 @@ test("ensureSession rejects an unsafe session name before touching tmux", async 
   assert.equal(result.stage, "name");
 });
 
-test("ensureSession reports missing pane id / socket as failures", async () => {
+test("an empty pane id from display-message means missing, not broken", async () => {
+  // Measured on tmux 3.6: display-message -t <missing> exits 0 and prints the
+  // default context, so the pane half is empty while the socket half is fine.
+  // Treating that as a broken session is what left an agent with an empty TMUX.
+  const { run, calls } = fakeTmux([
+    { match: HANDOFF, result: ok("|/tmp/tmux-1000/default|\n") },
+    { match: ["new-session"], result: ok("%42|/tmp/tmux-1000/default|\n") },
+  ]);
+  const result = await new TmuxClient(run).ensureSession({
+    name: "paseo-a",
+    cwd: "/w",
+    cols: 220,
+    rows: 60,
+    placeholder: "/bin/bash -l",
+    layout: "even-horizontal",
+  });
+  assert.equal(result.ok, true, `must create instead: ${JSON.stringify(result)}`);
+  if (!result.ok) return;
+  assert.equal(result.handle.created, true);
+  assert.equal(result.handle.paneId, "%42");
+  assert.ok(calls.some((args) => args[0] === "new-session"), "must fall through to creation");
+});
+
+test("ensureSession still reports a handoff it cannot use as a failure", async () => {
   const noPane = fakeTmux([
     { match: HANDOFF, result: fail("no such") },
+    { match: ["new-session"], result: fail("cannot create") },
+    { match: ["new-session"], result: fail("cannot create either") },
   ]);
   const a = await new TmuxClient(noPane.run).ensureSession({
     name: "paseo-a",
@@ -670,11 +695,12 @@ test("ensureSession reports missing pane id / socket as failures", async () => {
   });
   assert.equal(a.ok, false);
   if (a.ok) return;
-  assert.equal(a.stage, "pane-id");
+  assert.equal(a.stage, "new-session");
 
-  // Session exists but the handoff is unusable: no socket half.
+  // Created, but no usable handoff afterwards.
   const noSocket = fakeTmux([
     { match: HANDOFF, result: ok("%3||\n") },
+    { match: ["new-session"], result: ok("%3||\n") },
   ]);
   const b = await new TmuxClient(noSocket.run).ensureSession({
     name: "paseo-a",
@@ -686,7 +712,7 @@ test("ensureSession reports missing pane id / socket as failures", async () => {
   });
   assert.equal(b.ok, false);
   if (b.ok) return;
-  assert.equal(b.stage, "socket");
+  assert.equal(b.stage, "pane-id", `expected a handoff failure, got ${JSON.stringify(b)}`);
 });
 
 test("probe reflects tmux availability", async () => {

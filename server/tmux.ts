@@ -906,23 +906,26 @@ export class TmuxClient {
       return { ok: false, stage: "name", message: `unsafe session name: ${options.name}` };
     }
     /**
-     * One call answers "does this session exist" *and* returns the handoff when it
-     * does. The previous sequence spent six sequential execs (has-session, possibly
-     * new-session, select-layout, display pane id, socket path, server pid); at 15s
-     * per exec through a sandbox prefix that could outlast Paseo's 30s plugin-hook
-     * budget and fail `agent.session_open` outright, which strands the agent.
+     * One call returns the handoff when the session is usable. The previous sequence
+     * spent six sequential execs (has-session, possibly new-session, select-layout,
+     * display pane id, socket path, server pid); at 15s per exec through a sandbox
+     * prefix that could outlast Paseo's 30s plugin-hook budget and fail
+     * `agent.session_open` outright, which strands the agent.
+     *
+     * `display-message` cannot be used as an existence check. Measured on tmux 3.6
+     * against a session that does not exist:
+     *
+     *   $ tmux display-message -p -t <missing> '#{pane_id}|#{socket_path}|...'
+     *   |/tmp/tmux-1000/default|
+     *   exit=0
+     *
+     * It falls back to the default context instead of failing, so an empty pane id
+     * means "not usable" and must lead to creation - not to a failure. (Shipping it
+     * as a failure is what left an agent with an empty TMUX on 2026-10-29.)
      */
     const existing = await this.run(displayHandoffCmd(options.name));
-    if (existing.ok) {
-      const reused = parseHandoff(existing.stdout);
-      if (!reused.paneId || !reused.socketPath) {
-        return {
-          ok: false,
-          // One call carries both halves, but it can still say which one is missing.
-          stage: reused.paneId ? "socket" : "pane-id",
-          message: existing.stderr || `session ${options.name} reported no pane id or socket`,
-        };
-      }
+    const reused = parseHandoff(existing.stdout);
+    if (existing.ok && reused.paneId && reused.socketPath) {
       return {
         ok: true,
         handle: {
@@ -956,7 +959,9 @@ export class TmuxClient {
         }),
       );
       // A duplicate-session failure usually means a concurrent open for the same
-      // agent won the race; its session is just as good as ours.
+      // agent won the race; its session is just as good as ours. This is the one
+      // place a real existence check is needed, because display-message cannot say
+      // "missing" - it answers with the default context instead.
       if (!fallback.ok) {
         const raced = await this.run(displayHandoffCmd(options.name));
         const winner = parseHandoff(raced.stdout);

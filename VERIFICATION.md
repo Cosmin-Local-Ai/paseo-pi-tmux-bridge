@@ -1140,6 +1140,43 @@ Plus two safety layers, because exec count alone cannot guarantee the budget: pe
 (`TMUX=""`, Amos subagents blocked) rather than failing the open - a degraded agent is recoverable, a
 stranded one is not.
 
+## 8. My one-call handoff was wrong: `display-message` does not fail on a missing target
+
+The fix in §7 broke agent creation instead of speeding it up. A scout spawn failed, and the
+plugin's own log said:
+
+```
+05:28:24  tmux resolved to /usr/bin/tmux (sbx:pi-recovery-test)
+05:28:25  tmux session paseo-a68262c4-... unavailable (pane-id): session ... reported no pane id or socket
+```
+
+The prefix and the resolution were fine. The premise "one call answers existence *and* the
+handoff" was false. Measured on tmux 3.6 against a session that does not exist:
+
+```console
+$ tmux display-message -p -t paseo-a68262c4-... '#{pane_id}|#{socket_path}|#{server_pid}'
+|/tmp/tmux-1000/default|
+exit=0
+```
+
+`display-message` falls back to the default context instead of failing, so the pane half came
+back empty while the socket half looked valid. `ensureSession` read that as "session exists but is
+broken", returned `stage: "pane-id"`, and the hook fail-falled to an empty `TMUX` - which is exactly
+the symptom the agent reported (`$TMUX = (empty)`).
+
+Now an empty pane half means **missing**, so it falls through to creation. `has-session` is still used
+where a real existence answer is required (after both creates fail, to adopt a concurrent winner).
+
+Re-run against the real tmux, driving `ensureSession` directly:
+
+```
+create: true calls: 3 [ 'display-message -p', 'new-session -d', 'select-layout -t' ]
+reuse : true calls: 4 [ 'display-message -p' ]      # 1 exec for reuse
+```
+
+The `missing -> created` case is pinned by the unit test
+`an empty pane id from display-message means missing, not broken`.
+
 ## Still not proven
 
 Real `sbx`/containerd sandbox (the harness is `unshare`+`nsenter`, not their runtime); `agent.closed`
