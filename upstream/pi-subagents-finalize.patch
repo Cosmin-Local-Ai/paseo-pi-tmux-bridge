@@ -1,0 +1,39 @@
+--- a/packages/server/src/server/agent/providers/pi/extensions/pi-subagents/index.ts
++++ b/packages/server/src/server/agent/providers/pi/extensions/pi-subagents/index.ts
+@@ -56,6 +56,21 @@
+   return "completed";
+ }
+ 
++/**
++ * Status for a completed `subagent` call whose result does not match the pi-subagents protocol.
++ * Such a track has no other completion path: `poll()` and the `subagent-notify` notice follow only
++ * runs registered from a parsed `details`, and `bg_wait` needs a runId from one. A foreign
++ * extension that names its spawn tool `subagent` lands here, so settle it instead of leaving it
++ * running forever.
++ */
++function unrecognizedResultStatus(
++  callStatus: PiExtensionToolCall["status"],
++  detailsMatch: boolean,
++): "failed" | "completed" | undefined {
++  if (callStatus === "failed") return "failed";
++  return detailsMatch ? undefined : "completed";
++}
++
+ /** The `subagent-notify` header; a grouped notice reports every run as completed. */
+ function noticeStatus(header: string) {
+   if (/^Background tasks completed \(\d+\):/.test(header)) return "completed";
+@@ -145,10 +160,10 @@
+       const details = Details.safeParse(
+         typeof call.result === "object" ? call.result?.details : null,
+       );
+-      if (!details.success || details.data.mode === "management")
+-        return call.status === "failed"
+-          ? { detail, subagents: [{ ...base, status: "failed" as const }] }
+-          : { detail };
++      if (!details.success || details.data.mode === "management") {
++        const status = unrecognizedResultStatus(call.status, details.success);
++        return status ? { detail, subagents: [{ ...base, status }] } : { detail };
++      }
+       if (details.data.runId) callsByRun.set(details.data.runId, call.callId);
+       if (details.data.results.length === 0 && (details.data.asyncId || args.data.async)) {
+         rememberAsyncRun(details.data, call);
