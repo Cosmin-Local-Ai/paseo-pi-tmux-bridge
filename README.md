@@ -6,6 +6,10 @@ Built for [`amosblomqvist/pi-interactive-subagents`](https://github.com/amosblom
 
 ## What it looks like
 
+Captured 2026-10-27/28, so they predate finished-pane transcripts and reaping (v0.4.0+). The layout
+is current; the namespace label reads `sbx:pi-namespaced-test` because that was the sandbox under test
+at the time - a real agent shows its own provider, e.g. `sbx:pi-recovery-test`.
+
 The panel, docked beside the agent chat, showing two panes side by side with live screen captures:
 
 ![tmux panel with two panes beside the chat](evidence/15-panel-explorer-side-by-side-with-chat.png)
@@ -20,9 +24,10 @@ subagent's live Pi TUI on the right:
 
 ![attach terminal showing two panes inside the namespace](evidence/21-namespaced-attach-terminal-two-panes.png)
 
-And when tmux cannot be found, the panel states it instead of staying blank:
-
-![tmux not found diagnostic](evidence/18-panel-tmux-not-found-diagnostic.png)
+(An older screenshot of the "tmux not found" diagnostic used to sit here. It is gone from the README
+because that failure no longer happens on a sandboxed provider - the plugin now resolves tmux inside
+the agent's namespace. The image is still in `evidence/18-panel-tmux-not-found-diagnostic.png` for
+the record, and `VERIFICATION.md` keeps the details of how it was reproduced.)
 
 ## The problem
 
