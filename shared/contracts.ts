@@ -87,6 +87,30 @@ export const bridgeSettings = defineSettings({
      * is what a three-subagent session sustains; drop it for a single pane.
      */
     livePollMs: z.number().int().min(200).max(10000).default(1000),
+    /**
+     * Close a subagent pane once tmux reports it dead. The panel's live tick
+     * captures the pane's final transcript **first** and only then sends
+     * `kill-pane`, so freeing the layout never costs the scrollback. The pane at
+     * index 0 — the placeholder Amos splits every subagent from — is never a
+     * candidate, and neither is any pane tmux does not report as dead.
+     */
+    reapDeadPanes: z.boolean().default(true),
+    /**
+     * How many finished-pane transcripts the daemon keeps per agent, newest last
+     * (0 keeps none: the pane is still reaped, only the transcript is dropped).
+     * They live in daemon memory only, and die with the daemon.
+     */
+    finishedPaneLimit: z.number().int().min(0).max(20).default(6),
+    /**
+     * Opt in to tmux keeping finished panes at all: the plugin sets
+     * `remain-on-exit on` on its own session, which is what makes `pane_dead=1`
+     * observable and lets the reap path free layout instead of the pane simply
+     * vanishing. Off by default because it also keeps the session alive when the
+     * placeholder shell exits, and a dead placeholder pane is exactly what breaks
+     * Amos's split target. Finished panes are still captured (as `vanished`
+     * transcripts) with this off.
+     */
+    keepFinishedPanes: z.boolean().default(false),
   }),
 });
 
@@ -118,6 +142,12 @@ const paneDtoSchema = z.object({
   paneWidth: z.string(),
   paneHeight: z.string(),
   active: z.boolean(),
+  /**
+   * tmux says this pane's process exited but the pane is still there. The panel
+   * marks it in the header; the stream tick reaps it unless `reapDeadPanes` is
+   * off. Defaults to false so an older server bundle still validates.
+   */
+  dead: z.boolean().default(false),
 });
 
 export type TmuxPaneDto = z.output<typeof paneDtoSchema>;
@@ -178,6 +208,35 @@ export const capturePaneRpc = defineRpc({
 });
 
 /**
+ * A pane the server reaped, with the transcript captured before the kill. This
+ * is the "nothing is lost" half of the reap: after `kill-pane` tmux drops the
+ * pane and its history, so the text has to be read out while the pane is still
+ * there (see `FINISHED_CAPTURE_LINES` in server/tmux.ts). `text` went through
+ * the same sanitizer as a live capture, so the panel renders it on the same
+ * ANSI path. Kept in daemon memory only.
+ */
+const finishedPaneSchema = z.object({
+  paneId: z.string(),
+  title: z.string(),
+  command: z.string(),
+  width: z.string(),
+  height: z.string(),
+  text: z.string(),
+  lines: z.number().int().min(0),
+  /** epoch ms of the capture, which is also when the pane was killed. */
+  at: z.number().int().min(0),
+  /**
+   * `reaped` = the plugin killed a pane tmux reported dead, after capturing it.
+   * `killed` = a kill the panel asked for, also captured first.
+   * `vanished` = tmux removed the pane itself (its default), so `text` is the
+   * last live capture, **not** necessarily that pane's final output.
+   */
+  reason: z.enum(["reaped", "killed", "vanished"]),
+});
+
+export type FinishedPaneDto = z.output<typeof finishedPaneSchema>;
+
+/**
  * Near-live pane content. The server arms `tmux pipe-pane` per pane and uses the
  * growth of those log files as a **change signal**, while the text itself still
  * comes from `capture-pane -p -e` (the pipe stream carries keystroke echo and
@@ -211,8 +270,16 @@ export const streamPanesRpc = defineRpc({
         lines: z.number().int().min(0),
         /** Whether this pane's pipe is armed **and** its log is present. */
         piping: z.boolean(),
+        /** tmux reports this pane's process as exited. */
+        dead: z.boolean().default(false),
       }),
     ),
+    /**
+     * Finished panes this daemon has reaped, oldest first, newest last, capped at
+     * `finishedPaneLimit`. A pane appears here only after its transcript was
+     * captured, so the panel can show a killed pane's last screen.
+     */
+    finished: z.array(finishedPaneSchema).default([]),
     detail: z.string().optional(),
   }),
 });

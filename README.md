@@ -178,6 +178,56 @@ first pass failed *slowly*. `targetForAgent` starts with the host prefix for age
 record, and on a daemon host without tmux an uncached probe plus a 25s retry costs more than the RPC
 budget - which is exactly how that timeout appeared after a few subagents were spawned at once.
 
+## Finished subagent panes keep their transcript
+
+What happens to a finished subagent pane depends on one tmux option, and the plugin handles both cases.
+The important measurement first: on the box this was built on, `tmux show-options -g remain-on-exit`
+answers **off**, and with that tmux *removes* a pane the instant its process exits — `tests/reap-pane-check.ts`
+reproduces it: one second after the command exits the pane is simply absent from `list-panes`, not
+marked dead. So on a default tmux the pane already closes itself; what would otherwise be lost is its
+output.
+
+**Default regime (`remain-on-exit off`).** When a pane that was present on the previous tick is gone, the
+last live capture the plugin held for it becomes a finished entry, `reason: vanished`. Nothing is read
+after the fact — a pane that no longer exists cannot be captured — and the UI says that out loud rather
+than implying it is the pane's final output.
+
+**Opt-in regime (`keepFinishedPanes: true`, which sets `remain-on-exit on` on the plugin's own
+session).** The finished pane then stays visible with `pane_dead=1`, and the live tick can do better:
+`capture-pane -p -e -S -200` first, `kill-pane -t <pane>` only after that capture came back, and the
+transcript is queued as `reason: reaped`. This is the only path that *closes* a finished pane and frees
+the layout — on a default tmux there is nothing to close.
+
+All of it lands in a collapsed **finished (n)** section: pane id, command, title, size, capture time,
+reason, and the captured text rendered through the same ANSI path as a live pane. A pane tmux reports
+dead is marked `· dead` in its header while it is still there. The panel's **Kill pane** button is
+capture-first too: same depth, capture before `kill-pane`, queued as `reason: killed`; if the capture
+fails the kill is refused rather than silently lossy. A failed `kill-pane` leaves the pane in the
+listing so the next tick retries, and the failure surfaces in `detail`.
+
+Three things this deliberately does not claim:
+
+- **A `vanished` transcript is the last screen the plugin had**, not necessarily the pane's final output.
+  If that matters, turn on `keepFinishedPanes` so the pane is still readable when the tick notices.
+- **Transcripts live in daemon memory only.** Not written to disk, not restored: a daemon restart, a
+  plugin reload, or the session going away drops them. `finishedPaneLimit: 0` keeps none.
+- **The pane at index 0 is never a finished subagent.** That is the placeholder pane the plugin created
+  and the pane Amos splits every subagent from; its disappearance means the session is going away, and
+  it is never reaped either (`reapDeadPanes: false` turns reaping off entirely, but index 0 is off
+  limits regardless).
+
+`keepFinishedPanes` is off by default for a concrete reason: `remain-on-exit on` also keeps the session
+alive when the placeholder shell exits, and a dead placeholder is exactly what breaks Amos's split
+target (see "The problem"). Turn it on only if you want finished panes to sit there until the plugin
+captures and closes them.
+
+One false positive had to be designed out: a `list-panes` that **fails** (busy sandbox, dropped exec)
+returns nothing, and nothing taken at face value reads as "every pane finished at once". The tick uses
+`tryListPanes`, which reports the failure, and a failed listing never promotes anything.
+
+The whole sequence is asserted against a real tmux by `tests/reap-pane-check.ts` (reap, vanish, failed
+listing): `CHECKOUT=$HOME/src/paseo npx --prefix "$CHECKOUT" tsx tests/reap-pane-check.ts`.
+
 ## Settings
 
 `paseo daemon config` / the **Pi tmux bridge** settings screen:
@@ -196,6 +246,9 @@ budget - which is exactly how that timeout appeared after a few subagents were s
 | `killOnClose` | `true` | kill the session on close/archive |
 | `paneCaptureLines` | `15` | capture depth in the panel |
 | `livePollMs` | `1000` | how often the panel asks whether a pane produced output (200-10000) |
+| `reapDeadPanes` | `true` | capture a pane tmux reports dead, then `kill-pane` it (never pane index 0) |
+| `finishedPaneLimit` | `6` | how many finished panes keep their transcript in the panel, newest last (0-20; 0 keeps none) |
+| `keepFinishedPanes` | `false` | set `remain-on-exit on` on the plugin's own session, so a finished pane stays readable and gets reaped; also keeps the session alive when the placeholder shell exits |
 | `autoDetectPiProviders` | `true` | treat `pi`-derived provider ids (`pi-recovery`, …) as Pi |
 | `piProviders` | `[]` | exact extra provider ids to treat as Pi |
 | `stripAmosIdentity` | `true` | drop inherited `PI_SUBAGENT_*` vars from the agent env |

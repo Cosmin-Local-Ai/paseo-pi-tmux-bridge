@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import {
   usePaseo,
@@ -17,6 +17,7 @@ import {
   selectPaneRpc,
   sendKeysRpc,
   streamPanesRpc,
+  type FinishedPaneDto,
   type TmuxPaneDto,
 } from "../shared/contracts.ts";
 import {
@@ -54,6 +55,81 @@ const FALLBACK_LIVE_POLL_MS = 600;
 const FALLBACK_CAPTURE_LINES = 15;
 /** A full-size tab has the room; do not hold it to the explorer's 15 lines. */
 const WIDE_CAPTURE_LINES = 48;
+
+/** Timestamp of a finished-pane transcript; the pane itself is long gone by then. */
+function finishedAt(at: number): string {
+  const date = new Date(at);
+  return Number.isFinite(at) ? date.toLocaleTimeString() : String(at);
+}
+
+/**
+ * The server sends the whole finished FIFO on every tick, so the panel compares
+ * it before storing: a new array identity each second would repaint up to
+ * `finishedPaneLimit` × 200 captured lines on a poll whose whole design is "do
+ * not re-read what did not change".
+ */
+function sameFinished(a: FinishedPaneDto[], b: FinishedPaneDto[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((pane, index) => {
+      const other = b[index];
+      return (
+        other !== undefined &&
+        other.paneId === pane.paneId &&
+        other.at === pane.at &&
+        other.lines === pane.lines &&
+        other.reason === pane.reason
+      );
+    })
+  );
+}
+
+interface FinishedStyle {
+  item: Record<string, unknown>;
+  title: Record<string, unknown>;
+  muted: Record<string, unknown>;
+  screen: Record<string, unknown>;
+}
+
+/**
+ * What each reason actually means for the text below it. `vanished` is the one
+ * that needs saying out loud: tmux removed the pane (its default behaviour), so
+ * the transcript is the last screen the plugin had, not the pane's final output.
+ */
+const FINISHED_NOTE: Record<FinishedPaneDto["reason"], string> = {
+  reaped: "captured before the plugin killed the pane",
+  killed: "captured before the kill you asked for",
+  vanished: "last live capture — tmux removed the pane, so this may not be its final output",
+};
+
+/** Memoised for the same reason as the identity check above. */
+const FinishedPaneRow = memo(function FinishedPaneRow({
+  pane,
+  palette,
+  base,
+  styles,
+}: {
+  pane: FinishedPaneDto;
+  palette: AnsiPalette;
+  base: Record<string, unknown>;
+  styles: FinishedStyle;
+}) {
+  return (
+    <View style={styles.item}>
+      <Text style={styles.title}>
+        {`${pane.paneId} · ${pane.command || "?"} · ${pane.title || "(no title)"} · ${pane.width}x${pane.height} · ${finishedAt(pane.at)}`}
+      </Text>
+      <Text style={styles.muted}>
+        {`${pane.reason} · ${pane.lines} line${pane.lines === 1 ? "" : "s"} · ${FINISHED_NOTE[pane.reason]}`}
+      </Text>
+      {pane.text ? (
+        <AnsiScreen lines={parseAnsi(pane.text, palette)} palette={palette} base={base} />
+      ) : (
+        <Text style={styles.screen}>{"(no captured output)"}</Text>
+      )}
+    </View>
+  );
+});
 
 /**
  * `PluginTheme` carries no colorScheme, so the palette variant is inferred from
@@ -164,6 +240,14 @@ function TmuxPanelBody({
 
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [captures, setCaptures] = useState<Record<string, string>>({});
+  /**
+   * Panes the server already reaped, with the transcript it captured before the
+   * kill. The server owns this list (it is bounded by `finishedPaneLimit` and
+   * lives only in daemon memory), so every tick just replaces it wholesale.
+   */
+  const [finished, setFinished] = useState<FinishedPaneDto[]>([]);
+  /** Collapsed by default: finished panes must not crowd the live ones. */
+  const [showFinished, setShowFinished] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [detailPane, setDetailPane] = useState<{ paneId: string; text: string } | null>(null);
@@ -214,6 +298,7 @@ function TmuxPanelBody({
       setError(null);
       if (!result.exists) {
         setCaptures({});
+        setFinished([]);
         return;
       }
       // A pane that is gone must not keep painting a stale screen.
@@ -257,6 +342,10 @@ function TmuxPanelBody({
         }
         return next;
       });
+      // The server's list is the whole truth, newest last: a reaped pane leaves
+      // `panes` and appears here with the screen it had when it died. Keep the
+      // old identity while the content matches so the section does not repaint.
+      setFinished((current) => (sameFinished(current, result.finished) ? current : result.finished));
     } catch {
       // A dropped tick must not blank the panel: keep the last screens and say
       // `paused` until the stream comes back.
@@ -481,8 +570,31 @@ function TmuxPanelBody({
       primaryText: { color: theme.colors.accentForeground, fontSize: 12 },
       danger: { color: theme.colors.statusDanger, fontSize: 12 },
       warning: { color: theme.colors.statusWarning, fontSize: 12 },
+      // The finished section sits outside the pane row on purpose: a finished
+      // pane has no actions, and mixing it in would read like a live pane.
+      finishedHead: {
+        flexDirection: "row" as const,
+        alignItems: "center" as const,
+        gap: 8,
+      },
     }),
     [layout.compact, theme],
+  );
+
+  /** Passed as one stable object so `FinishedPaneRow` can stay memoised. */
+  const finishedStyles = useMemo(
+    () => ({
+      item: {
+        borderTopColor: theme.colors.border,
+        borderTopWidth: 1,
+        paddingTop: 8,
+        gap: 4,
+      },
+      title: { color: theme.colors.foreground, fontSize: 13 },
+      muted: { color: theme.colors.foregroundMuted, fontSize: 12 },
+      screen: { color: theme.colors.foregroundMuted, fontSize: 11, fontFamily: "monospace" },
+    }),
+    [theme],
   );
 
   const panes = snapshot?.panes ?? [];
@@ -580,8 +692,12 @@ function TmuxPanelBody({
               size={14}
               color={pane.active ? theme.colors.accent : theme.colors.foregroundMuted}
             />
-            <Text style={styles.paneTitle}>
-              {`${pane.paneId} · ${pane.paneCurrentCommand || "?"} · ${pane.paneWidth}x${pane.paneHeight}`}
+            {/* tmux says the process exited but the pane is still there; the
+                stream tick reaps it unless `reapDeadPanes` is off, so say so here
+                rather than letting it look like a live pane. */}
+            <Text style={pane.dead ? styles.warning : styles.paneTitle}>
+              {`${pane.paneId} · ${pane.paneCurrentCommand || "?"} · ${pane.paneWidth}x${pane.paneHeight}` +
+                (pane.dead ? " · dead" : "")}
             </Text>
           </Pressable>
           <Text style={styles.paneTitle}>
@@ -650,6 +766,37 @@ function TmuxPanelBody({
       {panes.length === 0 && snapshot?.exists ? (
         <View style={styles.card}>
           <Text style={styles.muted}>{"This session has no panes."}</Text>
+        </View>
+      ) : null}
+
+      {finished.length > 0 ? (
+        <View style={styles.card}>
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => setShowFinished((current) => !current)}
+            style={styles.finishedHead}
+          >
+            <Icon
+              name={showFinished ? "ChevronDown" : "ChevronRight"}
+              size={14}
+              color={theme.colors.foregroundMuted}
+            />
+            <Text style={styles.paneTitle}>{`finished (${finished.length})`}</Text>
+            <Text style={styles.muted}>
+              {"pane closed by the plugin after its last screen was captured"}
+            </Text>
+          </Pressable>
+          {showFinished
+            ? finished.map((pane) => (
+                <FinishedPaneRow
+                  key={pane.paneId}
+                  pane={pane}
+                  palette={palette}
+                  base={ansiBase}
+                  styles={finishedStyles}
+                />
+              ))
+            : null}
         </View>
       ) : null}
 

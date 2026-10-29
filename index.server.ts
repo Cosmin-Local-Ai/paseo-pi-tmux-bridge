@@ -16,6 +16,7 @@ import {
   streamPanesRpc,
 } from "./shared/contracts.ts";
 import type { BridgeSettings } from "./shared/contracts.ts";
+import type { FinishedPane, TrackedPane } from "./server/tmux.ts";
 import { sanitizeCapture } from "./shared/ansi.ts";
 import { BridgeBookkeeping } from "./server/bookkeeping.ts";
 import {
@@ -39,6 +40,8 @@ import {
   buildInjectedEnv,
   buildTmuxUnavailableEnv,
   execLabel,
+  finishedCaptureLines,
+  finishedEntry,
   isOwnSessionName,
   isPiProviderId,
   paneLogDir,
@@ -47,16 +50,20 @@ import {
   parsePathLookup,
   parsePaneLogSizes,
   pathBaseFor,
+  pushFinishedPane,
   resolveExecPrefix,
   resolvePlaceholderCommand,
   resolveTmuxPath,
   selectChangedPanes,
+  selectReapablePanes,
+  selectVanishedPanes,
   sessionNameFor,
   shouldHandleSessionOpen,
   shellProbeInvocation,
   tmuxCandidatePaths,
   tmuxDirToInject,
   tmuxInvocation,
+  trackPane,
 } from "./server/tmux.ts";
 import type { PrefixValues, TmuxRunResult } from "./server/tmux.ts";
 import type { TmuxClient as TmuxClientType, TmuxRun } from "./server/tmux.ts";
@@ -150,10 +157,35 @@ export default function contribute(server: PluginServerContext): () => void {
   /** One stream tick per agent at a time, so a slow exec cannot stack polls. */
   const streamInFlight = new Set<string>();
   const panePipesRearmed = new Set<string>();
+  /**
+   * Transcripts of panes this plugin instance reaped, newest last, capped at
+   * `finishedPaneLimit`. Daemon memory only: a restart loses them, which is why
+   * the README says so out loud. They are cleared with the rest of the stream
+   * state so a replacement session cannot inherit another session's panes.
+   */
+  const finishedPanes = new Map<string, FinishedPane[]>();
+  /**
+   * What the last good tick saw: the panes that were present (enough to describe
+   * one after tmux removes it) and the newest capture text still held for each.
+   * Rebuilt from the current listing on every successful tick, so it is bounded by
+   * one session's pane count and cannot outlive it; a failed listing leaves it
+   * alone instead of erasing it.
+   */
+  const paneMemory = new Map<string, { panes: TrackedPane[]; text: Record<string, string> }>();
+  /**
+   * Panes the panel's own `kill-pane` RPC already queued capture-first, as
+   * `<agentId>|<paneId>`. The next tick will see the pane disappear; without this
+   * it would queue a second, vaguer `vanished` entry over the accurate `killed`
+   * one, because the FIFO dedupes by pane id.
+   */
+  const rpcKilledPanes = new Set<string>();
 
   function clearPaneStreamState(agentId: string): void {
     paneLogSizes.delete(agentId);
+    finishedPanes.delete(agentId);
+    paneMemory.delete(agentId);
     const prefixKey = `${agentId}|`;
+    for (const killed of rpcKilledPanes) if (killed.startsWith(prefixKey)) rpcKilledPanes.delete(killed);
     for (const armed of panePipesArmed) if (armed.startsWith(prefixKey)) panePipesArmed.delete(armed);
     for (const armed of panePipesRearmed) {
       if (armed.startsWith(prefixKey)) panePipesRearmed.delete(armed);
@@ -691,6 +723,7 @@ export default function contribute(server: PluginServerContext): () => void {
           rows: SESSION_ROWS,
           placeholder: resolvePlaceholderCommand(settings.placeholderCmd, process.env),
           layout: settings.layout || AMOS_LAYOUT,
+          keepFinishedPanes: settings.keepFinishedPanes,
         }),
         HOOK_HANDOFF_BUDGET_MS,
       );
@@ -1080,16 +1113,69 @@ export default function contribute(server: PluginServerContext): () => void {
         return { agentId: input.agentId, sessionName: name, exists: false, tmuxAvailable: true, panes: [] };
       }
       // The pane set comes from this agent's session, which is the ownership
-      // guard the single-pane RPCs have to do by hand.
-      const panes = await tmux.listPanes(name);
+      // guard the single-pane RPCs have to do by hand. `tryListPanes` rather than
+      // `listPanes`: an empty list caused by a failed exec must not read as "every
+      // pane disappeared", which is the one way this feature could invent finished
+      // panes out of a sandbox hiccup.
+      const listed = await tmux.tryListPanes(name);
+      if (!listed.ok) problems.push(`list-panes: ${listed.stderr}`);
+      const panes = listed.panes;
+      const lines = input.lines ?? settings.paneCaptureLines;
+      const remembered = paneMemory.get(input.agentId);
+
+      // A dead pane is reaped, not polled. It comes out of the live set for two
+      // reasons: the transcript below is the copy the panel keeps, so capturing
+      // it twice in one tick is a wasted exec, and arming it is a call tmux
+      // refuses — measured on tmux 3.6, `pipe-pane -t <dead pane> -o …` exits 1
+      // with `target pane has exited`, which would cost a failing exec per pane
+      // per tick for as long as the dead pane sits there.
+      const reapable = selectReapablePanes(panes, { reapDeadPanes: settings.reapDeadPanes });
+      const reapIds = new Set(reapable.map((pane) => pane.paneId));
+      const livePanes = panes.filter((pane) => !reapIds.has(pane.paneId));
+
+      // Capture FIRST, then kill: after `kill-pane` tmux drops the pane *and* its
+      // history, so this is the only copy that survives. `finishedCaptureLines`
+      // is deeper than the live capture for exactly that reason (measured: a dead
+      // pane captured with `-S -200` still returned all 30 of its history lines,
+      // plus tmux's own `Pane is dead (status 0, …)` trailer).
+      let finished = finishedPanes.get(input.agentId) ?? [];
+      // A lowered `finishedPaneLimit` trims what is already held, it does not
+      // only spare the next entry; 0 drops everything the daemon still keeps.
+      if (finished.length > settings.finishedPaneLimit) {
+        finished = finished.slice(finished.length - settings.finishedPaneLimit);
+      }
+      for (const pane of reapable) {
+        const body = await captureBody(tmux, pane.paneId, finishedCaptureLines(lines));
+        if (body.text.length === 0 && body.detail) {
+          // The capture itself failed, so killing now would throw the transcript
+          // away without leaving a trace. Leave the pane; it is still listed, so
+          // the next tick reaps it, and the failure goes into `detail`.
+          problems.push(`final capture ${pane.paneId}: ${body.detail}`);
+          continue;
+        }
+        if (body.detail) problems.push(`${pane.paneId}: ${body.detail}`);
+        const killed = await tmux.killPane(pane.paneId);
+        if (!killed.ok) {
+          // tmux refused the kill: keep the pane for the next tick and report it.
+          // The transcript is not queued yet, so the panel cannot end up showing
+          // a finished entry for a pane it is also still showing live.
+          problems.push(`kill-pane ${pane.paneId}: ${killed.stderr || "failed"}`);
+          continue;
+        }
+        finished = pushFinishedPane(
+          finished,
+          finishedEntry(trackPane(pane), body.text, "reaped", Date.now()),
+          settings.finishedPaneLimit,
+        );
+      }
 
       // Panes armed by *this* call: measured on tmux 3.6, the log file does not
       // exist yet in the listing taken moments later, because the pipe's shell
       // has to start before its `>>` redirect opens.
       const armedNow = new Set<string>();
-      for (const pane of panes) {
+      for (const pane of livePanes) {
         const key = `${input.agentId}|${pane.paneId}`;
-        if (panePipesArmed.has(key)) continue;
+        if (pane.dead || panePipesArmed.has(key)) continue;
         const path = paneLogPath(name, pane.paneId);
         if (!path) continue;
         const armed = await tmux.pipePane(pane.paneId, path);
@@ -1111,11 +1197,10 @@ export default function contribute(server: PluginServerContext): () => void {
       const previous = paneLogSizes.get(input.agentId) ?? {};
       // A failed listing proves nothing, so this tick captures everything (the
       // old behaviour) but keeps the last good baseline for the next one.
-      const changed = new Set(selectChangedPanes(panes, sizes ?? {}, previous));
-      const lines = input.lines ?? settings.paneCaptureLines;
+      const changed = new Set(selectChangedPanes(livePanes, sizes ?? {}, previous));
 
       const captured = await Promise.all(
-        panes.map(async (pane) => {
+        livePanes.map(async (pane) => {
           const key = `${input.agentId}|${pane.paneId}`;
           // "piping" is only claimed when the log is actually there; a failed
           // listing cannot prove either way, so an armed pipe is assumed.
@@ -1123,16 +1208,66 @@ export default function contribute(server: PluginServerContext): () => void {
             panePipesArmed.has(key) &&
             (armedNow.has(key) || sizes === null || sizes[pane.paneId] !== undefined);
           if (!changed.has(pane.paneId)) {
-            return { paneId: pane.paneId, changed: false, text: "", lines: 0, piping };
+            return { paneId: pane.paneId, changed: false, text: "", lines: 0, piping, dead: pane.dead };
           }
           const body = await captureBody(tmux, pane.paneId, lines);
           if (body.detail) problems.push(`${pane.paneId}: ${body.detail}`);
-          return { paneId: pane.paneId, changed: true, text: body.text, lines: body.lines, piping };
+          return {
+            paneId: pane.paneId,
+            changed: true,
+            text: body.text,
+            lines: body.lines,
+            piping,
+            dead: pane.dead,
+          };
         }),
       );
 
+      // Panes that were present on the last good tick and are simply gone. This is
+      // the path that works on a default tmux: with `remain-on-exit off` — the
+      // measured default here — tmux removes a pane the moment its process exits,
+      // so there is never a `pane_dead` pane to reap. The text is the last capture
+      // held, from this or an earlier tick: a pane that no longer exists cannot be
+      // read, so this is honestly labelled `vanished` and the panel says it is not
+      // necessarily the pane's final output.
+      const vanished = selectVanishedPanes(
+        remembered?.panes ?? [],
+        listed.ok ? livePanes : null,
+      );
+      for (const pane of vanished) {
+        // The FIFO dedupes by pane id and the newest entry wins, so a pane this
+        // very tick reaped must not also be promoted here: the next tick will see
+        // it as gone, and a shallow `vanished` entry built from the last live
+        // capture would overwrite the accurate `reaped` one built from the
+        // 200-line capture. (Same reason for the panel's own kill: see
+        // `rpcKilledPanes`.)
+        if (reapIds.has(pane.paneId)) continue;
+        const key = `${input.agentId}|${pane.paneId}`;
+        // Already queued capture-first by the panel's own kill-pane RPC, with the
+        // accurate reason; drop the marker rather than queue a vaguer duplicate.
+        if (rpcKilledPanes.delete(key)) continue;
+        finished = pushFinishedPane(
+          finished,
+          finishedEntry(pane, remembered?.text[pane.paneId] ?? "", "vanished", Date.now()),
+          settings.finishedPaneLimit,
+        );
+      }
+      if (finished.length > 0) finishedPanes.set(input.agentId, finished);
+      else finishedPanes.delete(input.agentId);
+
+      if (listed.ok) {
+        const fresh = new Map(captured.map((entry) => [entry.paneId, entry]));
+        const text: Record<string, string> = {};
+        for (const pane of livePanes) {
+          const update = fresh.get(pane.paneId);
+          const held = update?.changed ? update.text : remembered?.text[pane.paneId];
+          if (held !== undefined) text[pane.paneId] = held;
+        }
+        paneMemory.set(input.agentId, { panes: livePanes.map(trackPane), text });
+      }
+
       if (sizes) {
-        for (const pane of panes) {
+        for (const pane of livePanes) {
           const key = `${input.agentId}|${pane.paneId}`;
           if (!panePipesArmed.has(key) || armedNow.has(key)) continue;
           if (sizes[pane.paneId] !== undefined) continue;
@@ -1149,7 +1284,7 @@ export default function contribute(server: PluginServerContext): () => void {
           if (!again.ok) problems.push(`re-arm ${pane.paneId}: ${again.stderr || "failed"}`);
         }
         const next: Record<string, number> = {};
-        for (const pane of panes) {
+        for (const pane of livePanes) {
           const size = sizes[pane.paneId];
           if (size !== undefined) next[pane.paneId] = size;
         }
@@ -1162,6 +1297,7 @@ export default function contribute(server: PluginServerContext): () => void {
         exists: true,
         tmuxAvailable: true,
         panes: captured,
+        finished,
         ...(problems.length > 0 ? { detail: problems.join("; ") } : {}),
       };
     } catch (error) {
@@ -1191,16 +1327,40 @@ export default function contribute(server: PluginServerContext): () => void {
     return { ok: result.ok, paneId: input.paneId, detail: result.ok ? undefined : result.stderr };
   });
 
+  // Kill from the panel. Same order as the automatic reap — capture, then kill —
+  // because a hand-kill that silently threw the pane's screen away would be the
+  // surprising one now that the plugin can keep transcripts.
   server.handle(killPaneRpc, async (input) => {
-    const { name } = await sessionFor(input.agentId);
+    const { settings, name } = await sessionFor(input.agentId);
     if (!name) return { ok: false, paneId: input.paneId, detail: "unknown agent" };
     const { tmux } = await clientForAgent(input.agentId, name);
     const panes = await tmux.listPanes(name);
-    if (!panes.some((pane) => pane.paneId === input.paneId)) {
+    const target = panes.find((pane) => pane.paneId === input.paneId);
+    if (!target) {
       return { ok: false, paneId: input.paneId, detail: "pane is not in this agent's session" };
     }
+    const body = await captureBody(
+      tmux,
+      input.paneId,
+      finishedCaptureLines(settings.paneCaptureLines),
+    );
+    if (body.text.length === 0 && body.detail) {
+      // Nothing was captured, so killing now would lose the pane with no record.
+      // Refuse and let the operator retry; the pane is still on screen.
+      return { ok: false, paneId: input.paneId, detail: `not killed, capture failed: ${body.detail}` };
+    }
     const result = await tmux.killPane(input.paneId);
-    return { ok: result.ok, paneId: input.paneId, detail: result.ok ? undefined : result.stderr };
+    if (!result.ok) return { ok: false, paneId: input.paneId, detail: result.stderr };
+    rpcKilledPanes.add(`${input.agentId}|${input.paneId}`);
+    finishedPanes.set(
+      input.agentId,
+      pushFinishedPane(
+        finishedPanes.get(input.agentId) ?? [],
+        finishedEntry(trackPane(target), body.text, "killed", Date.now()),
+        settings.finishedPaneLimit,
+      ),
+    );
+    return { ok: true, paneId: input.paneId };
   });
 
   // Typing into a pane is the one RPC that changes agent state, so it repeats
@@ -1304,5 +1464,8 @@ export default function contribute(server: PluginServerContext): () => void {
     paneLogSizes.clear();
     panePipesArmed.clear();
     panePipesRearmed.clear();
+    finishedPanes.clear();
+    paneMemory.clear();
+    rpcKilledPanes.clear();
   };
 }

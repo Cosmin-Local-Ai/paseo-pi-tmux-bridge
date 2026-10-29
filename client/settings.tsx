@@ -154,6 +154,20 @@ function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfacePr
           disabled={settings.saving}
           onValueChange={(killOnClose) => patch({ killOnClose })}
         />
+        <SettingsSwitch
+          label="Reap finished panes"
+          hint="When tmux reports a pane dead, capture its transcript first, then kill the pane. The placeholder pane at index 0 is never touched."
+          value={values.reapDeadPanes}
+          disabled={settings.saving}
+          onValueChange={(reapDeadPanes) => patch({ reapDeadPanes })}
+        />
+        <SettingsSwitch
+          label="Keep finished panes (remain-on-exit)"
+          hint="Off (tmux default): a pane is deleted when its process exits, and the panel keeps its last capture as a 'vanished' transcript. On: the session keeps the pane so the reap path can free layout, but the session also survives the placeholder shell exiting — which breaks Amos's split target — so this is opt-in."
+          value={values.keepFinishedPanes}
+          disabled={settings.saving}
+          onValueChange={(keepFinishedPanes) => patch({ keepFinishedPanes })}
+        />
       </SettingsCard>
       <SettingsCard>
         <SettingsInput
@@ -241,6 +255,13 @@ function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfacePr
           settings={settings}
           onCommit={(livePollMs) => patch({ livePollMs })}
         />
+        <NumberField
+          label="Finished pane transcripts (0-20)"
+          hint="How many reaped panes keep their transcript in the panel, newest last. 0 still reaps the pane but keeps no scrollback. Daemon memory only — a daemon restart drops them."
+          value={values.finishedPaneLimit}
+          settings={settings}
+          onCommit={(finishedPaneLimit) => patch({ finishedPaneLimit })}
+        />
       </SettingsCard>
       <SettingsRow label="Current values">
         <View>
@@ -250,7 +271,9 @@ function Controls({ settings, theme }: { settings: Ready; theme: PluginSurfacePr
           </Text>
           <Text style={style}>
             placeholder {values.placeholderCmd} · delay {values.shellReadyDelayMs}ms · capture{" "}
-            {values.paneCaptureLines} lines · live every {values.livePollMs}ms
+            {values.paneCaptureLines} lines · live every {values.livePollMs}ms · reap{" "}
+            {values.reapDeadPanes ? `on (${values.finishedPaneLimit} kept)` : "off"} · keep{" "}
+            {values.keepFinishedPanes ? "on" : "off"}
           </Text>
           <Text style={style}>
             tmux {values.tmuxPath || "(probed)"} · exec {JSON.stringify(values.tmuxExec)} · per

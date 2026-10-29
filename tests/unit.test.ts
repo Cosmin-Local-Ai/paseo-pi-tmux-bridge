@@ -8,11 +8,13 @@ import { join } from "node:path";
 import {
   AMOS_IDENTITY_ENV_KEYS,
   AMOS_LAYOUT,
+  CAPTURE_LINES_LIMIT,
   DEFAULT_LAYOUT,
   DEFAULT_PLACEHOLDER_CMD,
   DEFAULT_SESSION_PREFIX,
   DEFAULT_SHELL_READY_DELAY_MS,
   FALLBACK_PLACEHOLDER_CMD,
+  FINISHED_CAPTURE_LINES,
   HANDOFF_FORMAT,
   SESSION_ENV_KEY,
   SHELL_READY_ENV_KEY,
@@ -29,6 +31,8 @@ import {
   displayServerPidCmd,
   displaySocketPathCmd,
   execLabel,
+  finishedCaptureLines,
+  finishedEntry,
   hasSessionCmd,
   isOwnSessionName,
   isSafeAgentId,
@@ -47,13 +51,16 @@ import {
   parseSocketPath,
   pathBaseFor,
   PANE_LOG_ROOT,
+  PLACEHOLDER_PANE_INDEX,
   paneLogDir,
+  remainOnExitCmd,
   paneLogPath,
   paneLogSizesScript,
   parsePaneLogSizes,
   pipePaneCmd,
   pipePaneStopCmd,
   prependToPath,
+  pushFinishedPane,
   binaryDirOf,
   resolveExecPrefix,
   resolvePlaceholderCommand,
@@ -62,6 +69,8 @@ import {
   selectChangedPanes,
   selectLayoutCmd,
   selectPaneCmd,
+  selectReapablePanes,
+  selectVanishedPanes,
   sendKeyCmd,
   sendKeysLiteralCmd,
   sessionNameFor,
@@ -71,6 +80,7 @@ import {
   TMUX_WHICH_ARGS,
   tmuxDirToInject,
   tmuxInvocation,
+  trackPane,
   TMUX_CANDIDATE_PATHS,
   TMUX_MISSING_DETAIL,
 } from "../server/tmux.ts";
@@ -400,7 +410,7 @@ test("command builders produce the spec'd argv", () => {
     "-t",
     "paseo-a",
     "-F",
-    "#{pane_id}|#{pane_index}|#{pane_current_command}|#{pane_pid}|#{pane_title}|#{pane_width}|#{pane_height}|#{pane_active}",
+    "#{pane_id}|#{pane_index}|#{pane_current_command}|#{pane_pid}|#{pane_title}|#{pane_width}|#{pane_height}|#{pane_active}|#{pane_dead}",
   ]);
 });
 
@@ -477,8 +487,10 @@ test("safety validators", () => {
 // ── parsers ────────────────────────────────────────────────────────────────
 
 test("parsePaneRows reads the formatted listing", () => {
+  // Nine cells, as PANE_FORMAT now asks for. `dead=1` is what a pane whose
+  // process exited looks like when tmux keeps the pane (measured on tmux 3.6).
   const out =
-    "%10|0|bash|7041|pi-recovery-test|220|60|1\n%11|1|node|7106|pi|109|59|0\nnot-a-pane\n";
+    "%10|0|bash|7041|pi-recovery-test|220|60|1|0\n%11|1|node|7106|pi|109|59|0|1\nnot-a-pane\n";
   const rows = parsePaneRows(out);
   assert.equal(rows.length, 2);
   assert.deepEqual(
@@ -489,6 +501,27 @@ test("parsePaneRows reads the formatted listing", () => {
   assert.equal(rows[1].active, false);
   assert.equal(rows[1].paneCurrentCommand, "node");
   assert.equal(rows[1].paneWidth, "109");
+  assert.equal(rows[0].dead, false);
+  assert.equal(rows[1].dead, true);
+});
+
+test("parsePaneRows treats a missing or empty pane_dead token as alive", () => {
+  // The `< 8` guard is unchanged on purpose: an older tmux, or one that expands
+  // an unknown format token to nothing, must still parse — and must never be
+  // read as "dead", because "dead" is what makes the reaper kill a pane.
+  const eight = parsePaneRows("%10|0|bash|7041|pi|220|60|1\n");
+  assert.equal(eight.length, 1);
+  assert.equal(eight[0].dead, false);
+  const empty = parsePaneRows("%10|0|bash|7041|pi|220|60|1|\n");
+  assert.equal(empty.length, 1);
+  assert.equal(empty[0].dead, false);
+  // Only the literal `1` is dead: tmux answers 0/1, and anything else (an empty
+  // expansion, a version that prints something else) leaves the pane alone.
+  assert.equal(parsePaneRows("%10|0|bash|7041|pi|220|60|1|0")[0].dead, false);
+  assert.equal(parsePaneRows("%10|0|bash|7041|pi|220|60|1|dead")[0].dead, false);
+  assert.equal(parsePaneRows("%10|0|bash|7041|pi|220|60|1|1")[0].dead, true);
+  // Seven cells is still junk, dead token or not.
+  assert.deepEqual(parsePaneRows("%10|0|bash|7041|pi|220|60\n"), []);
 });
 
 test("parsers reject malformed output", () => {
@@ -1167,4 +1200,223 @@ test("a pane is changed when its log grows, is new, or is missing", () => {
   assert.deepEqual(selectChangedPanes(panes, { "%1": 10, "%2": 20 }, sizes), ["%3"]);
   // A pane id that is not a pane id never reaches tmux.
   assert.deepEqual(selectChangedPanes([{ paneId: "%1;kill-server" }], { "%1": 5 }, {}), []);
+});
+
+// ── finished-pane reap (stream-panes) ──────────────────────────────────────
+
+test("selectReapablePanes takes only dead panes that are not the placeholder", () => {
+  const panes = [
+    // The pane `new-session` created, and the split target every Amos subagent
+    // hangs off. Even reported dead it must never be reaped: killing it kills
+    // the session and every later spawn with it.
+    { paneId: "%0", paneIndex: "0", dead: true },
+    { paneId: "%1", paneIndex: "1", dead: true },
+    { paneId: "%2", paneIndex: "2", dead: false },
+    // A live pane at index 0 is the normal state and is equally untouchable.
+    { paneId: "%3", paneIndex: "0", dead: false },
+  ];
+  assert.deepEqual(
+    selectReapablePanes(panes, { reapDeadPanes: true }).map((pane) => pane.paneId),
+    ["%1"],
+  );
+  // The setting off means off: not one candidate, whatever tmux reports.
+  assert.deepEqual(selectReapablePanes(panes, { reapDeadPanes: false }), []);
+  assert.deepEqual(selectReapablePanes([], { reapDeadPanes: true }), []);
+  assert.equal(PLACEHOLDER_PANE_INDEX, "0");
+});
+
+test("the reap decision keeps the generic pane shape", () => {
+  // It is called with `TmuxPane[]`, and it must not need more than the three
+  // fields the decision reads.
+  const rows = parsePaneRows("%11|1|node|7106|pi|109|59|0|1\n%12|2|bash|7107|pi|109|59|1|0\n");
+  assert.deepEqual(
+    selectReapablePanes(rows, { reapDeadPanes: true }).map((pane) => pane.paneId),
+    ["%11"],
+  );
+});
+
+test("the finished transcript FIFO is bounded, deduped by pane id, newest last", () => {
+  const entry = (paneId: string, text = paneId, reason: "reaped" | "vanished" = "reaped") => ({
+    paneId,
+    title: "pi",
+    command: "bash",
+    width: "110",
+    height: "49",
+    text,
+    lines: 1,
+    at: 1_700_000_000_000,
+    reason,
+  });
+  // Newest last, and the cap drops the oldest, not the newest.
+  let list: ReturnType<typeof pushFinishedPane> = [];
+  for (const paneId of ["%1", "%2", "%3", "%4"]) list = pushFinishedPane(list, entry(paneId), 3);
+  assert.deepEqual(
+    list.map((pane) => pane.paneId),
+    ["%2", "%3", "%4"],
+  );
+  // A failed kill leaves the pane in the listing, so the next tick captures the
+  // same pane again; that must replace the entry, not stack four copies of it.
+  list = pushFinishedPane(list, entry("%4", "second capture"), 3);
+  assert.deepEqual(
+    list.map((pane) => pane.paneId),
+    ["%2", "%3", "%4"],
+  );
+  assert.equal(list[2].text, "second capture");
+  // The reason is a label, not identity: a `vanished` entry for a pane that already
+  // has a `reaped` one replaces it instead of doubling the pane up.
+  list = pushFinishedPane(list, entry("%4", "gone", "vanished"), 3);
+  assert.equal(list.filter((pane) => pane.paneId === "%4").length, 1);
+  assert.equal(list[2].reason, "vanished");
+  // limit 0 = reap but keep nothing (the setting's documented meaning).
+  assert.deepEqual(pushFinishedPane(list, entry("%5"), 0), []);
+  assert.deepEqual(pushFinishedPane(list, entry("%5"), -1), []);
+  // Never mutates the array the caller still holds in its Map.
+  const before = list.map((pane) => pane.paneId);
+  pushFinishedPane(list, entry("%6"), 3);
+  assert.deepEqual(list.map((pane) => pane.paneId), before);
+});
+
+test("a finished capture is deeper than the live one, inside the schema bound", () => {
+  // This transcript is the only copy that outlives `kill-pane`, so 15 live lines
+  // is not enough; 200 measured enough to return a dead pane's whole history.
+  assert.equal(finishedCaptureLines(15), FINISHED_CAPTURE_LINES);
+  assert.equal(finishedCaptureLines(48), FINISHED_CAPTURE_LINES);
+  // A caller asking for more than 200 is not silently shortened.
+  assert.equal(finishedCaptureLines(300), 300);
+  // And never past what the RPC schema accepts.
+  assert.equal(finishedCaptureLines(5000), CAPTURE_LINES_LIMIT);
+  assert.equal(CAPTURE_LINES_LIMIT, 500, "must match the paneCaptureLines/stream max in contracts.ts");
+});
+
+test("selectVanishedPanes promotes a pane only when the listing really succeeded", () => {
+  const previous = [
+    // The placeholder: its disappearance means the session is going away, not that
+    // a subagent finished, and the next tick reports exists:false and clears state.
+    { paneId: "%0", paneIndex: "0" },
+    { paneId: "%9", paneIndex: "1" },
+    { paneId: "%10", paneIndex: "2" },
+  ];
+  assert.deepEqual(
+    selectVanishedPanes(previous, [{ paneId: "%0" }, { paneId: "%10" }]).map((pane) => pane.paneId),
+    ["%9"],
+  );
+  assert.deepEqual(selectVanishedPanes(previous, previous), []);
+  // A successful listing of a session that really has nothing but the placeholder:
+  // every non-placeholder pane is gone, and the placeholder is not promoted.
+  assert.deepEqual(
+    selectVanishedPanes(previous, [{ paneId: "%0" }]).map((pane) => pane.paneId),
+    ["%9", "%10"],
+  );
+  // The false-positive guard, and the reason `null` is in the signature: `null`
+  // means this tick's listing did not succeed (failed exec, container hiccup), and
+  // then nothing whatsoever counts as vanished. Without this, one lost exec reads
+  // as "the whole session finished".
+  assert.deepEqual(selectVanishedPanes(previous, null), []);
+  assert.deepEqual(selectVanishedPanes([], null), []);
+  assert.deepEqual(selectVanishedPanes([], []), []);
+});
+
+test("a finished entry carries the pane shape as last seen", () => {
+  const [row] = parsePaneRows("%9|1|node|7106|pi-recovery|110|49|0|1\n");
+  // The text handed in is what `captureBody` returns: sanitized and with trailing
+  // whitespace stripped, so the line count is the split of exactly that text.
+  const entry = finishedEntry(trackPane(row), "a\nb", "vanished", 1_700_000_000_000);
+  assert.equal(entry.paneId, "%9");
+  assert.equal(entry.title, "pi-recovery");
+  assert.equal(entry.command, "node");
+  assert.equal(entry.width, "110");
+  assert.equal(entry.height, "49");
+  assert.equal(entry.lines, 2);
+  assert.equal(entry.reason, "vanished");
+  // Line counting matches `captureBody`'s: an empty transcript is 0 lines, not 1.
+  const empty = finishedEntry(trackPane(row), "", "killed", 1_700_000_000_001);
+  assert.equal(empty.lines, 0);
+  assert.equal(empty.text, "");
+  assert.equal(empty.reason, "killed");
+});
+
+test("remain-on-exit builders only ever name a session and a boolean", () => {
+  assert.deepEqual(remainOnExitCmd("paseo-a", true), [
+    "set-option",
+    "-t",
+    "paseo-a",
+    "remain-on-exit",
+    "on",
+  ]);
+  assert.deepEqual(remainOnExitCmd("paseo-a", false), [
+    "set-option",
+    "-t",
+    "paseo-a",
+    "remain-on-exit",
+    "off",
+  ]);
+});
+
+test("ensureSession touches remain-on-exit only when keepFinishedPanes is on", async () => {
+  const base = {
+    name: "paseo-a",
+    cwd: "/w",
+    cols: 220,
+    rows: 60,
+    placeholder: "/bin/bash -l",
+    layout: "even-horizontal",
+  };
+  // Default: the create path stays exactly three execs; the plugin never changes
+  // a tmux session option the user did not ask for.
+  const off = fakeTmux([
+    { match: HANDOFF, result: fail("can't find session: paseo-a") },
+    { match: ["new-session"], result: ok("%42|/tmp/tmux-1000/default|1\n") },
+  ]);
+  assert.equal((await new TmuxClient(off.run).ensureSession(base)).ok, true);
+  assert.equal(
+    off.calls.some((args) => args[0] === "set-option"),
+    false,
+    "must not touch session options by default",
+  );
+  assert.equal(off.calls.length, 3);
+
+  // Opt-in, create path.
+  const created = fakeTmux([
+    { match: HANDOFF, result: fail("can't find session: paseo-a") },
+    { match: ["new-session"], result: ok("%42|/tmp/tmux-1000/default|1\n") },
+  ]);
+  await new TmuxClient(created.run).ensureSession({ ...base, keepFinishedPanes: true });
+  assert.deepEqual(
+    created.calls.find((args) => args[0] === "set-option"),
+    remainOnExitCmd("paseo-a", true),
+  );
+
+  // Opt-in, reuse path: a session created before the setting was turned on still
+  // gets it, which is why this is not only in the create branch.
+  const reused = fakeTmux([{ match: HANDOFF, result: ok("%77|/sock|123\n") }]);
+  await new TmuxClient(reused.run).ensureSession({ ...base, keepFinishedPanes: true });
+  assert.deepEqual(
+    reused.calls.map((args) => args[0]),
+    ["display-message", "set-option"],
+  );
+});
+
+test("tryListPanes separates 'no panes' from 'the listing failed'", async () => {
+  // The stream tick decides whether panes vanished, so it has to be able to tell
+  // these apart. Measured on tmux 3.6: a missing session exits 1 with
+  // `can't find session`, so the failure is visible when the caller asks.
+  const broken = fakeTmux([{ match: ["list-panes"], result: fail("can't find session: paseo-a") }]);
+  const listed = await new TmuxClient(broken.run).tryListPanes("paseo-a");
+  assert.equal(listed.ok, false);
+  assert.deepEqual(listed.panes, []);
+  assert.equal(listed.stderr, "can't find session: paseo-a");
+  // listPanes keeps its fail-closed shape for the ownership checks.
+  assert.deepEqual(await new TmuxClient(broken.run).listPanes("paseo-a"), []);
+
+  const guard = fakeTmux([]);
+  const bad = await new TmuxClient(guard.run).tryListPanes("bad name");
+  assert.equal(bad.ok, false);
+  assert.equal(guard.calls.length, 0, "an unsafe name never reaches tmux");
+
+  const good = fakeTmux([{ match: ["list-panes"], result: ok("%9|1|bash|1|pi|110|49|0|1\n") }]);
+  const fine = await new TmuxClient(good.run).tryListPanes("paseo-a");
+  assert.equal(fine.ok, true);
+  assert.equal(fine.stderr, "");
+  assert.equal(fine.panes.length, 1);
+  assert.equal(fine.panes[0].dead, true);
 });

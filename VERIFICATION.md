@@ -1181,3 +1181,169 @@ The `missing -> created` case is pinned by the unit test
 
 Real `sbx`/containerd sandbox (the harness is `unshare`+`nsenter`, not their runtime); `agent.closed`
 firing on its own; `resume`/`import` in a live daemon; Windows hosts.
+
+---
+
+# 2026-10-29 (fifth pass) — finished subagent panes keep their transcript
+
+Feature: when a subagent pane finishes, the panel keeps its output. Settings `finishedPaneLimit`
+(default 6), `reapDeadPanes` (default `true`) and `keepFinishedPanes` (default `false`).
+
+**Headline measurement, because it decided the design:** on this box
+```
+$ tmux show-options -g remain-on-exit
+remain-on-exit off
+```
+and with that tmux **removes a pane the moment its process exits**. `#{pane_dead}` therefore never
+expands to `1` for a finished subagent pane here — the pane is simply absent from `list-panes`. So a
+feature triggered by `pane_dead` is dead code on the default configuration, and the pane is already
+closing itself: what is actually missing is the transcript. The primary path is therefore the **vanished
+check** (a pane present on the last good tick and gone now gets the capture the plugin still holds), and
+the `pane_dead` reap is the opt-in path that only exists once `keepFinishedPanes` makes tmux keep the
+pane.
+
+## Measured: what `pane_dead` actually is on this box
+
+Live sessions first (the plugin's own sessions and the `pi-recovery` session):
+
+```console
+$ tmux list-panes -t pi-recovery -F '[#{pane_id}] dead=[#{pane_dead}] cmd=[#{pane_current_command}]'
+[%0] dead=[0] cmd=[pi]
+$ tmux show-options -g remain-on-exit
+remain-on-exit off
+$ grep -n remain ~/.tmux.conf          # nothing; the file sets mouse/keys/history/terminal only
+```
+
+So the token expands to `0`/`1` (it is not one of the tokens that expand to empty on this build — see
+the `pane_last_output` note in the README). Whether a dead pane is ever *observable* depends on
+`remain-on-exit`, which was measured separately, in a throwaway session (`probe-*`, killed after):
+
+```console
+$ tmux new-session -d -s probe-pane-dead; tmux split-window -t probe-pane-dead 'sleep 1; echo bye'
+# remain-on-exit off (the default): the pane is GONE once the command exits
+$ tmux list-panes -t probe-pane-dead -F '[#{pane_id}] idx=#{pane_index} dead=[#{pane_dead}] cmd=[#{pane_current_command}]'
+[%11] idx=0 dead=[0] cmd=[bash]
+
+$ tmux new-session -d -s probe-roe; tmux set-option -t probe-roe remain-on-exit on
+$ tmux split-window -t probe-roe 'sleep 1; echo bye'
+[%13] idx=0 dead=[0] dead_status=[] cmd=[bash]
+[%14] idx=1 dead=[1] dead_status=[0] cmd=[sleep]
+```
+
+What the plugin then does with such a pane, measured on the same probe:
+
+```console
+$ tmux pipe-pane -t %16 -o "cat >> /tmp/probe-dead.log"
+target pane has exited
+rc=1                                        # → arming a dead pane is a wasted failing exec
+$ tmux capture-pane -p -e -t %18 -S -200 | grep -c 'LINE-'
+30                                          # full history still readable on a dead pane
+$ tmux capture-pane -p -e -t %18 -S -200 | tail -1
+Pane is dead (status 0, Thu Oct 29 06:18:18 2026)
+$ tmux kill-pane -t %16; echo rc=$?
+rc=0
+$ tmux kill-pane -t %16
+can't find pane: %16                        # second kill fails, so kill failure must not drop state
+```
+
+Those four measurements are the reap design: skip `pipe-pane` for dead panes, capture at
+`FINISHED_CAPTURE_LINES` (200, clamped to the schema's 500) *before* the kill, and treat a failed kill
+as "leave it for the next tick". They are only reachable with `remain-on-exit on`, which is what the
+opt-in `keepFinishedPanes` sets — and which is off by default because it also keeps the session alive
+when the placeholder shell exits, and a dead placeholder is exactly the thing that breaks Amos's split
+target.
+
+## The vanished path — the one that runs on a default tmux
+
+Per agent the tick remembers the panes it saw and the newest capture text it holds (`paneMemory`,
+rebuilt from the current listing on every successful tick, so it is bounded by one session's pane count
+and dies with the stream state). On the next tick:
+
+- `selectVanishedPanes(previous, current | null)` returns the remembered panes that are no longer listed,
+  never the index-0 placeholder, and **nothing at all when `current` is `null`** — which is how the tick
+  marks "this listing did not succeed". That is the false-positive guard: `listPanes` returns `[]` both
+  for "no panes" and for "the exec failed", and treating the second as the first would dump the whole
+  session into `finished` on one container hiccup. The tick therefore calls the new
+  `TmuxClient.tryListPanes`, which reports the failure — measured on tmux 3.6 against a name that is not
+  there: `can't find window: <name>`, exit 1.
+- each vanished pane becomes a `finished` entry via `finishedEntry(trackPane(lastSeen), heldText,
+  "vanished", Date.now())`: id, title, command, width×height as last seen, the last capture held.
+- `reason` distinguishes `vanished` (tmux removed it; text is the **last live capture**, not necessarily
+  the final output — a pane that no longer exists cannot be read) from `reaped` (the plugin captured a
+  `pane_dead` pane and killed it) and `killed` (the panel's own kill-pane RPC, now capture-first too).
+- a pane the RPC already queued capture-first is marked in `rpcKilledPanes` and skipped by the vanished
+  check, so the accurate `killed` entry is not overwritten by a vaguer `vanished` one (the FIFO dedupes
+  by pane id).
+
+Pinned by the unit tests `selectVanishedPanes promotes a pane only when the listing really succeeded`,
+`a finished entry carries the pane shape as last seen`,
+`tryListPanes separates 'no panes' from 'the listing failed'` and
+`ensureSession touches remain-on-exit only when keepFinishedPanes is on`.
+
+## Measured: all three regimes, against real tmux (`tests/reap-pane-check.ts`)
+
+```console
+$ CHECKOUT=/tmp/paseo-build …/tsx tests/reap-pane-check.ts
+scenario 1 — remain-on-exit on (keepFinishedPanes): reap
+  list-panes: %30(idx 0, dead=false) %31(idx 1, dead=true)
+  reap candidate: %31 (index 1)
+  captured 30 history lines at depth 200
+  after kill: only %30 (index 0, alive) remains; reason=reaped
+  the next tick would also call it vanished; the reap guard suppresses that
+scenario 2 — remain-on-exit off (this box's default): vanished
+  while alive: %32(idx 0, dead=false) %33(idx 1, dead=false); held 230 chars
+  after the command exited: %32(idx 0, dead=false) — the pane is gone, not dead
+  promoted: reason=vanished lines=30 size=30x20 title=pi-recovery-test
+scenario 3 — failed listing must promote nothing
+  failed listing: ok=false stderr="can't find window: pi-tmux-bridge-reap-check-52439-missing"
+reap-pane-check: PASS
+```
+
+Scenario 2 is the reproduction of the finding: the subagent pane is alive and uncaptured-dead in one
+tick, absent in the next, and the held capture is what gets promoted. Scenario 3 proves the guard: a
+failed listing yields `ok:false` and no promotion, while an *empty but successful* listing still promotes
+the subagent pane and never the placeholder.
+
+## The invariant that decides what may be killed
+
+`pane_index == 0` is the placeholder pane `new-session` created and the pane Amos splits every subagent
+from (`TMUX_PANE` points at it). Killing it kills the session and every later spawn, so
+`selectReapablePanes` excludes it even when tmux marks it dead, and `selectVanishedPanes` never promotes
+it as a finished subagent — its disappearance means the session is going away, and the next tick reports
+`exists: false` and clears the stream state anyway. Pinned by the unit tests
+`selectReapablePanes takes only dead panes that are not the placeholder` and
+`selectVanishedPanes promotes a pane only when the listing really succeeded`, alongside the pre-existing
+`ensureSession reuses an existing session and never kills it` ("must never kill"). The automatic paths
+only ever call `kill-pane` — `kill-session` is not reachable from them.
+
+All of it is per-agent state in `Map`s next to the existing stream state (`finishedPanes`, `paneMemory`,
+`rpcKilledPanes`), cleared by `clearPaneStreamState` (session gone / agent closed) and by the plugin
+teardown, so a replacement session cannot inherit another session's transcripts or memory.
+
+## Not verified
+
+- **Neither path ever ran inside a live daemon.** Everything above is `TmuxClient` + the pure helpers
+  driven directly. The wiring in `index.server.ts` — `livePanes` split, the `paneMemory` rebuild, the
+  `rpcKilledPanes` suppression, `clearPaneStreamState`, the `finished` array on the wire, and the panel
+  rendering it — is exercised only by a running daemon. A live run must confirm that a finished subagent
+  pane disappears from the pane row and reappears under **finished (n)** with the right `reason`, and that
+  a failed `kill-pane` shows up in `detail`.
+- **How much of a subagent's output the `vanished` transcript holds is not measured.** It is whatever the
+  last tick captured (default depth 15 in the explorer, 48 in a tab). For the pane's real final output,
+  `keepFinishedPanes` is the honest answer; that combination (setting on → reap → 200-line transcript)
+  was verified only by scenario 1 of the probe, not by a daemon run.
+- The panel's **finished (n)** section, the `· dead` header marker and the reason line were type-checked
+  and compiled, not rendered in the app.
+- Pipe-log files under `/tmp/pi-tmux-bridge/` are still never deleted for a finished pane (pre-existing);
+  neither the reap nor the vanished path cleans the log a pane left behind.
+- `keepFinishedPanes` is applied in `ensureSession` (create and reuse paths) but was not exercised
+  through a real `agent.session_open`; only the argv and the call sites are tested.
+
+## Static checks for this pass
+
+```
+node --test tests/unit.test.ts tests/ansi.test.ts   → 98 pass / 0 fail (76 unit + 22 ansi; was 66 + 22)
+CHECKOUT=/tmp/paseo-build … tsx tests/compile-check.mjs → PASS (79380 B server / 70881 B client)
+tsc -p tsconfig.json --noEmit                        → clean
+tsx tests/reap-pane-check.ts                         → PASS, three scenarios (output above)
+```

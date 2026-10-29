@@ -513,8 +513,18 @@ export function displayServerPidCmd(): string[] {
   return ["display-message", "-p", "#{pid}"];
 }
 
+/**
+ * The listing the panel and the reap decision both read.
+ *
+ * `#{pane_dead}` was added for the finished-pane reap: measured on this box's
+ * tmux 3.6 (`list-panes -t pi-recovery -F '[#{pane_id}] dead=[#{pane_dead}]'`)
+ * it expands to `0` for a live pane and to `1` for a pane whose process has
+ * exited but is still present (`remain-on-exit on`, measured). Older tmux builds
+ * expand an unknown format to the empty string, and `parsePaneRows` treats
+ * anything that is not `1` as alive, so the token is safe to request.
+ */
 export const PANE_FORMAT =
-  "#{pane_id}|#{pane_index}|#{pane_current_command}|#{pane_pid}|#{pane_title}|#{pane_width}|#{pane_height}|#{pane_active}";
+  "#{pane_id}|#{pane_index}|#{pane_current_command}|#{pane_pid}|#{pane_title}|#{pane_width}|#{pane_height}|#{pane_active}|#{pane_dead}";
 
 export function listPanesCmd(name: string): string[] {
   return ["list-panes", "-t", name, "-F", PANE_FORMAT];
@@ -674,6 +684,177 @@ export function selectChangedPanes(
   return changed;
 }
 
+// ── finished panes: reap and transcript ───────────────────────────────────
+
+/**
+ * The pane `new-session` creates, and the one every later Amos subagent splits
+ * off (`TMUX_PANE` points at it). Killing it kills the session and breaks every
+ * later spawn, so it is never a reap candidate — the invariant the "must never
+ * kill-session" tests already protect.
+ */
+export const PLACEHOLDER_PANE_INDEX = "0";
+
+/**
+ * Depth of a finished pane's final transcript. It must be deeper than the live
+ * capture, because this is the only copy that survives the kill. Measured on tmux
+ * 3.6 with a dead pane that had printed 30 lines: `capture-pane -p -e -S -200`
+ * returned all 30 lines plus tmux's own `Pane is dead (status 0, …)` trailer.
+ */
+export const FINISHED_CAPTURE_LINES = 200;
+
+/** The `lines` bound the RPC schema accepts (`paneCaptureLines` maxes out here). */
+export const CAPTURE_LINES_LIMIT = 500;
+
+/** Never shallower than the live poll asked for, never past the schema bound. */
+export function finishedCaptureLines(liveLines: number): number {
+  return Math.min(CAPTURE_LINES_LIMIT, Math.max(FINISHED_CAPTURE_LINES, liveLines));
+}
+
+/**
+ * Which panes the stream tick may reap. Pure, because everything inside the
+ * plugin activation closure is not unit-testable in this repo and this is the
+ * decision that decides whether a pane dies: a pane is reapable only when tmux
+ * itself reports it dead, when reaping is enabled, and when it is not the
+ * placeholder pane at index 0.
+ *
+ * This is the *opt-in* half of the feature. `pane_dead=1` requires the session to
+ * keep a finished pane (`remain-on-exit on`, which only `keepFinishedPanes` sets
+ * here); with the tmux default of `remain-on-exit off` — measured on this box,
+ * `tmux show-options -g remain-on-exit` — the pane is gone the moment its process
+ * exits and this never fires. `selectVanishedPanes` is the path that works on a
+ * default tmux; see VERIFICATION.md.
+ *
+ * Pane ids come out of `parsePaneRows`, which already rejects anything that is
+ * not `%<digits>`, so no extra validation happens here.
+ */
+export function selectReapablePanes<P extends Pick<TmuxPane, "paneId" | "paneIndex" | "dead">>(
+  panes: readonly P[],
+  opts: { reapDeadPanes: boolean },
+): P[] {
+  if (!opts.reapDeadPanes) return [];
+  return panes.filter(
+    (pane) => pane.dead && pane.paneIndex !== PLACEHOLDER_PANE_INDEX,
+  );
+}
+
+/**
+ * Why a pane ended up in the finished list. The three are not interchangeable:
+ * only `reaped` and `killed` had their text read out of the pane on the way out;
+ * `vanished` means tmux removed the pane itself and the text is the last capture
+ * the panel still held, which is not necessarily that pane's final output.
+ */
+export type FinishedPaneReason = "reaped" | "killed" | "vanished";
+
+/** One finished pane's transcript, as the panel renders it. */
+export interface FinishedPane {
+  paneId: string;
+  title: string;
+  command: string;
+  width: string;
+  height: string;
+  /** Sanitized ANSI capture — the same `sanitizeCapture` output the live path sends. */
+  text: string;
+  lines: number;
+  /** epoch ms; the pane itself is gone by the time the client sees this. */
+  at: number;
+  reason: FinishedPaneReason;
+}
+
+/**
+ * What the stream tick remembers about a pane it saw, enough to describe it after
+ * it is gone. Pane ids are reused only when tmux restarts, so remembering by id
+ * across one tick is safe.
+ */
+export interface TrackedPane {
+  paneId: string;
+  paneIndex: string;
+  title: string;
+  command: string;
+  width: string;
+  height: string;
+}
+
+export function trackPane(pane: TmuxPane): TrackedPane {
+  return {
+    paneId: pane.paneId,
+    paneIndex: pane.paneIndex,
+    title: pane.paneTitle,
+    command: pane.paneCurrentCommand,
+    width: pane.paneWidth,
+    height: pane.paneHeight,
+  };
+}
+
+/**
+ * The finished entry for a pane whose text the caller already holds — the
+ * vanished and RPC-killed paths. `lines` is counted the same way `captureBody`
+ * counts it, so a live capture and a finished transcript report line counts
+ * identically.
+ */
+export function finishedEntry(
+  pane: TrackedPane,
+  text: string,
+  reason: FinishedPaneReason,
+  at: number,
+): FinishedPane {
+  return {
+    paneId: pane.paneId,
+    title: pane.title,
+    command: pane.command,
+    width: pane.width,
+    height: pane.height,
+    text,
+    lines: text.length === 0 ? 0 : text.split("\n").length,
+    at,
+    reason,
+  };
+}
+
+/**
+ * Which panes disappeared since the last good tick — the path that works on a
+ * default tmux, where a finished subagent pane is simply removed. Pure, and the
+ * `null` case is the point: `current` is `null` when this tick's listing did not
+ * succeed, and then nothing counts as vanished. Without that, one failed exec in
+ * a busy sandbox reads as "every pane vanished at once" and dumps the whole
+ * session into the finished list.
+ *
+ * The placeholder pane is never promoted: its disappearance means the session is
+ * going away, not that a subagent finished, and the next tick reports
+ * `exists: false` and clears the stream state anyway.
+ */
+export function selectVanishedPanes<P extends { paneId: string; paneIndex: string }>(
+  previous: readonly P[],
+  current: readonly { paneId: string }[] | null,
+): P[] {
+  if (current === null) return [];
+  const present = new Set(current.map((pane) => pane.paneId));
+  return previous.filter(
+    (pane) => !present.has(pane.paneId) && pane.paneIndex !== PLACEHOLDER_PANE_INDEX,
+  );
+}
+
+/**
+ * Bounded FIFO of finished-pane transcripts: newest last, at most `limit`, one
+ * entry per pane id. `limit <= 0` keeps nothing, which is what
+ * `finishedPaneLimit: 0` means — the pane is still reaped, only the transcript
+ * is not kept.
+ *
+ * Deduped by pane id because a failed `kill-pane` leaves the pane in the listing,
+ * so the next tick captures the same pane again; the newer capture replaces the
+ * older entry instead of stacking duplicates. Returns a new array so the caller
+ * can store it in a per-agent Map without aliasing.
+ */
+export function pushFinishedPane(
+  current: readonly FinishedPane[],
+  entry: FinishedPane,
+  limit: number,
+): FinishedPane[] {
+  if (limit <= 0) return [];
+  const kept = current.filter((pane) => pane.paneId !== entry.paneId);
+  kept.push(entry);
+  return kept.length > limit ? kept.slice(kept.length - limit) : kept;
+}
+
 /**
  * Literal text: `-l` stops tmux from interpreting the payload as key names, so
  * shell metacharacters reach the pane as characters.
@@ -718,6 +899,17 @@ export function killSessionCmd(name: string): string[] {
   return ["kill-session", "-t", name];
 }
 
+/**
+ * `remain-on-exit` is what makes a finished pane stay visible as `pane_dead=1`
+ * instead of being removed. Only ever applied to the plugin's own session, and
+ * only when `keepFinishedPanes` is on: it also keeps the session alive when the
+ * placeholder shell exits, and a dead placeholder is exactly what breaks Amos's
+ * split target (SPEC/README), so the default is tmux's own — off.
+ */
+export function remainOnExitCmd(name: string, on: boolean): string[] {
+  return ["set-option", "-t", name, "remain-on-exit", on ? "on" : "off"];
+}
+
 export function attachArgs(name: string): string[] {
   return ["attach", "-t", name];
 }
@@ -737,8 +929,15 @@ export interface TmuxPane {
   paneWidth: string;
   paneHeight: string;
   active: boolean;
+  /** `#{pane_dead}` — true only when tmux still shows a pane whose process exited. */
+  dead: boolean;
 }
 
+/**
+ * The `< 8` guard is deliberately unchanged: a row with the old eight cells must
+ * still parse (older tmux, or a build that drops the trailing token), and a
+ * missing ninth cell simply means "not dead".
+ */
 export function parsePaneRows(stdout: string): TmuxPane[] {
   return stdout.split("\n").flatMap((line) => {
     const cells = line.trim().split("|");
@@ -753,6 +952,7 @@ export function parsePaneRows(stdout: string): TmuxPane[] {
         paneWidth: cells[5] as string,
         paneHeight: cells[6] as string,
         active: cells[7] === "1",
+        dead: cells[8] === "1",
       },
     ];
   });
@@ -865,6 +1065,12 @@ export interface EnsureSessionOptions {
   rows: number;
   placeholder: string;
   layout: string;
+  /**
+   * `remain-on-exit on` for this session, so a finished pane stays visible as
+   * `pane_dead=1` and the stream tick can capture it and free the layout. Off by
+   * default — see `remainOnExitCmd` for why that default is the safe one.
+   */
+  keepFinishedPanes?: boolean;
 }
 
 export interface SessionHandle {
@@ -926,6 +1132,9 @@ export class TmuxClient {
     const existing = await this.run(displayHandoffCmd(options.name));
     const reused = parseHandoff(existing.stdout);
     if (existing.ok && reused.paneId && reused.socketPath) {
+      // Reuse is deliberately one exec, so this only costs anything when the
+      // user turned the setting on.
+      if (options.keepFinishedPanes) await this.run(remainOnExitCmd(options.name, true));
       return {
         ok: true,
         handle: {
@@ -990,6 +1199,11 @@ export class TmuxClient {
       // Cosmetic; a layout failure must not block the launch.
       await this.run(selectLayoutCmd(options.name, options.layout));
     }
+    if (options.keepFinishedPanes) {
+      // Cosmetic in the same way: if tmux refuses, the reap path simply has no
+      // dead pane to see and the vanished path still works.
+      await this.run(remainOnExitCmd(options.name, true));
+    }
 
     // `new-session -P -F` already printed the handoff; fall back to one query only
     // when that output was unusable (older tmux, empty stdout).
@@ -1023,10 +1237,30 @@ export class TmuxClient {
     return (await this.run(hasSessionCmd(name))).ok;
   }
 
-  async listPanes(name: string): Promise<TmuxPane[]> {
-    if (!isSafeSessionName(name)) return [];
+  /**
+   * A pane listing that says whether the listing itself worked. `listPanes`
+   * returns [] both for "no panes" and for "the exec failed", which is the right
+   * answer for an ownership check (fail closed) and the wrong one for
+   * disappearance detection: one failed exec through a busy sandbox would read as
+   * "every pane vanished at once" and dump the whole session into the finished
+   * list. Measured on tmux 3.6 against a name that is not there, `list-panes -t`
+   * exits 1 with `can't find window: <name>`, so the failure is visible whenever
+   * the caller asks for it.
+   */
+  async tryListPanes(name: string): Promise<{ ok: boolean; panes: TmuxPane[]; stderr: string }> {
+    if (!isSafeSessionName(name)) {
+      return { ok: false, panes: [], stderr: `unsafe session name: ${name}` };
+    }
     const res = await this.run(listPanesCmd(name));
-    return res.ok ? parsePaneRows(res.stdout) : [];
+    return {
+      ok: res.ok,
+      panes: res.ok ? parsePaneRows(res.stdout) : [],
+      stderr: res.ok ? "" : res.stderr || "list-panes failed",
+    };
+  }
+
+  async listPanes(name: string): Promise<TmuxPane[]> {
+    return (await this.tryListPanes(name)).panes;
   }
 
   async capturePane(paneId: string, lines: number): Promise<TmuxRunResult> {
